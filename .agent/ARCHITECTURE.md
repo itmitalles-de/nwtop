@@ -1,10 +1,13 @@
 # Architecture
 
 `main.rs` owns CLI validation, source selection, refresh timing and terminal
-restoration. `ui.rs` receives snapshots and draws the nvtop-style layout; it
-never derives measurements from queue lengths or substitutes demo values.
-`config.rs` owns versioned user preferences, XDG path resolution and atomic
-private writes. `main.rs` applies explicit CLI overrides, `NO_COLOR` and the
+restoration. `ui.rs` owns application state and input; its private `ui/render`
+modules draw the nvtop-style layout from snapshots. `ui/format.rs` supplies
+display units, and `ui/demo.rs` supplies only explicitly requested demo data.
+The renderer never derives measurements from queue lengths or substitutes demo values.
+`config/settings.rs` owns the versioned preference schema and pure validation;
+`config.rs` keeps XDG path resolution and atomic private writes together.
+`main.rs` applies explicit CLI overrides, `NO_COLOR` and the
 unavailable-interface fallback to a runtime copy only; the UI tracks fields the
 user changed by key or in F2 Setup, and F12 writes the file values plus only
 those fields. Unknown keys warn and are preserved on save. As root, saving into a
@@ -43,7 +46,8 @@ UI translates; older helpers without notes keep working with English text, so
 the protocol version is unchanged.
 The UI itself never receives capabilities or elevated user IDs.
 
-`collector.rs` reads `/proc/net/dev`, sysfs interface metadata and getifaddrs.
+`collector/interfaces.rs` reads `/proc/net/dev`, sysfs interface metadata and getifaddrs;
+`collector.rs` owns sampling, worker orchestration, counters and attribution.
 Interface indexes come from `if_nametoindex`/AF_PACKET entries, never a 0
 fallback; IPv4 alias labels (`eth0:1`) map to their device, so VIPs are local.
 Interface rates are monotonic counter deltas divided by the measured interval.
@@ -83,8 +87,9 @@ IP bytes; interface totals also include
 other protocols and link overhead. All-interface mode can observe the same
 traffic at several virtual links and warns accordingly.
 
-`sockets.rs` correlates flow endpoints with the current namespace's socket tables
-and `/proc/PID/fd` socket inodes. Identity includes PID and start time. Descriptor
+`sockets.rs` correlates flow endpoints with socket tables and inode owners acquired
+by `sockets/procfs.rs`; `sockets/diagnostics.rs` owns host SOCK_DIAG queries and
+their retry state. Identity includes PID and start time. Descriptor
 scans run promptly when unscanned inodes or exited cached owners appear, spaced
 by at least 200 ms or ten times the previous scan's cost, and otherwise every
 five seconds; cached owners are revalidated against `/proc/PID/stat` each second.
@@ -189,3 +194,46 @@ builds do not require clang/libbpf or extra capabilities. Runtime status exposes
 backend errors and drops; F1/JSON distinguish extended from sampled collection.
 VM-only `tests/extended.py` and `tests/namespaces.py` exercise short TCP/UDP
 lifetimes, exited owners, namespace paths and NAT without tracing the host.
+
+## Source inventory and refactoring boundaries (#22)
+
+The 2026-10-15 pass inventoried all 73 tracked files at `f598a26`, including
+20 `src` Rust files, `build.rs`, the BPF source, Python/C integration harnesses,
+installers, CI and the static site. File size alone does not justify splitting
+an evidence state machine: much of the large attribution files is regression
+coverage. No dependencies, wire schemas, thresholds or measurements changed.
+
+| Source boundary | Responsibility and decision |
+| --- | --- |
+| `ui.rs` | Public facade, input, filtering, sorting and runtime preferences; 2,435 lines became 674 after extracting rendering and tests. |
+| `ui/render.rs`, `ui/render/{graph,overlays}.rs` | Main layout, history plots and modal panels; consume the existing `App` state without changing keys, text, colors or dimensions. |
+| `ui/{format,demo}.rs` | Shared display units and explicit preview data; existing `ui` exports are preserved. |
+| `config.rs`, `config/settings.rs` | Private atomic file operations separated from schema/defaults/validation. Symlink, ownership, hardlink and size checks stay in the file boundary. |
+| `collector.rs`, `collector/interfaces.rs` | Attribution/counters separated from host counters, addresses, topology and default-route discovery. Worker timing and scope rules stay together in the collector. |
+| `sockets.rs`, `sockets/{procfs,diagnostics}.rs` | Inventory and conservative endpoint resolution separated from bounded Linux metadata reads and host-only SOCK_DIAG transport/retry. PID identity, ambiguity, retention and limits are unchanged. |
+| `conntrack.rs`, `conntrack/codec.rs` | Cache generations, quarantine and worker I/O remain together; pure netlink validation produces metadata without I/O or cache writes. |
+| `event_owners.rs` | Keep the cohesive bounded evidence-window/actor/namespace state machine and its extensive adversarial tests. |
+| `extended.rs` | Keep event, descriptor, packet and NAT evidence orchestration together; its ownership decisions share state. |
+| `events.rs` | Keep the feature-gated libbpf ABI, attach order, owning worker and loss accounting together. |
+| `capture.rs` | Keep the owning pcap lifecycle, capability boundary, fragment quarantine, bounded queues and clock conversion. |
+| `packet.rs`, `links.rs` | Already separate bounded packet parsing and route-netlink link discovery. |
+| `main.rs` | Keep CLI overrides, helper fallback, terminal lifetime and event-loop integration. |
+| `helper.rs`, `bin/nwtop-collector.rs`, `privilege.rs` | Keep the bounded protocol and privileged entry point/capability operations separate from UI and configuration. |
+| `input.rs`, `shutdown.rs` | Small existing event and cooperative signal lifetime boundaries. |
+| `model.rs`, `i18n.rs`, `lib.rs` | Public snapshot schema, language text and crate surface remain unchanged. |
+| `build.rs`, `bpf/` | Optional CO-RE compilation and matching BPF/Rust record ABI; retain layout assertions and kernel safety boundaries. |
+| `tests/`, `scripts/`, `.github/workflows/` | Keep real traffic, isolation, installer, feature and MSRV checks. Add a public-API rendering characterization test. |
+| `site/` | Existing static website and assets reviewed in the inventory; no UI, copy or build changes. |
+
+The extracted modules are private; facade re-exports preserve existing public
+paths. Tests for extracted internals live beside their owning modules, retaining
+all existing safety cases. `tests/ui_contract.rs` records 48 deterministic full
+terminal buffers, including symbols, colors and modifiers, through the public
+API before the renderer split: both languages, narrow/wide terminals, all
+panels, both chart styles, connections, search and unavailable capture.
+
+Compiler/Clippy checks found no dead-code warning in either feature mode.
+Similar parsers intentionally follow different procfs, packet and netlink wire
+formats; sharing them would obscure bounds and endian rules. BPF/Rust layout
+mirroring is an explicit cross-language ABI. No speculative removal of public
+items or generic abstraction was introduced merely to reduce line counts.

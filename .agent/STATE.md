@@ -1,5 +1,28 @@
 # Verified state
 
+## Source refactoring #22 (2026-10-15)
+
+- Full tracked-file inventory and source-boundary decisions are in
+  `ARCHITECTURE.md`. Private modules separate UI state/rendering/demo data,
+  preference schema/file I/O, interface metadata/attribution, procfs and
+  SOCK_DIAG/inventory matching, and conntrack parsing/cache lifecycle.
+- Public Rust paths remain available through the original facades. No dependency,
+  BPF code, capability policy, protocol, layout, text or measurement rule changed.
+  All 157 existing Rust test functions remain; one characterization test adds
+  48 fixed terminal-buffer comparisons, recorded before moving the renderer.
+- Baseline: 148 default / 157 ebpf Rust tests plus terminal and Setup suites.
+  After: 149 / 158 tests on both stable and Rust 1.88.0, Clippy in both feature
+  modes, formatting, both release builds, terminal restoration, Setup, ShellCheck
+  and dependency audit passed.
+- Baseline and final standard binaries passed real IPv4/IPv6 TCP/UDP capture,
+  short-lived sockets and the capability-helper/installer suite in a disposable
+  Ubuntu 24.04 KVM guest. The guest process retained desktop CPU isolation.
+- Evidence is outside Git at
+  `~/.codex/reports/refactoring-2026-10-15/nwtop/`: module inventory, checks,
+  binary hashes, the unchanged-function comparison and VM logs. Additional
+  optional BPF kernel stress suites are recorded separately when run.
+- This is a local validated branch checkpoint, not an installation or release.
+
 ## Full review fixes (2026-10-10)
 
 - #18: first-fragment port evidence is scoped by interface and direction;
