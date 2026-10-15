@@ -17,6 +17,10 @@
 - Baseline and final standard binaries passed real IPv4/IPv6 TCP/UDP capture,
   short-lived sockets and the capability-helper/installer suite in a disposable
   Ubuntu 24.04 KVM guest. The guest process retained desktop CPU isolation.
+- Final optional eBPF binaries also passed `tests/extended.py` and the complete
+  `tests/namespaces.py` matrix in that guest: short-lived and receive-only
+  sockets, lifecycle bursts, namespace/NAT and selected-interface boundaries.
+  Adversarial clock/overflow stress was not rerun; BPF source is unchanged.
 - Evidence is outside Git at
   `~/.codex/reports/refactoring-2026-10-15/nwtop/`: module inventory, checks,
   binary hashes, the unchanged-function comparison and VM logs. Additional
