@@ -7,7 +7,9 @@ use std::{
     collections::{HashMap, HashSet},
     ffi::{CStr, CString},
     fs,
+    mem::MaybeUninit,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    ptr::NonNull,
     time::{Duration, Instant},
 };
 
@@ -104,6 +106,44 @@ fn base_interface_name(label: &str) -> &str {
     label.split_once(':').map_or(label, |(name, _)| name)
 }
 
+/// Owns the complete libc allocation; borrowed entries cannot outlive it.
+struct IfAddrs {
+    head: NonNull<libc::ifaddrs>,
+}
+
+impl IfAddrs {
+    fn read() -> Option<Self> {
+        let mut head = MaybeUninit::<*mut libc::ifaddrs>::uninit();
+        // SAFETY: getifaddrs receives writable storage for its output pointer.
+        // Only success guarantees that storage has been initialized.
+        if unsafe { libc::getifaddrs(head.as_mut_ptr()) } != 0 {
+            return None;
+        }
+        // SAFETY: successful getifaddrs initialized head. A non-null result
+        // owns the whole list until the matching freeifaddrs in Drop.
+        NonNull::new(unsafe { head.assume_init() }).map(|head| Self { head })
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &libc::ifaddrs> {
+        let mut current = Some(self.head);
+        std::iter::from_fn(move || {
+            // SAFETY: current is a non-null member of the live libc list.
+            // The returned reference is tied to this owner's shared borrow.
+            let entry = unsafe { current?.as_ref() };
+            current = NonNull::new(entry.ifa_next);
+            Some(entry)
+        })
+    }
+}
+
+impl Drop for IfAddrs {
+    fn drop(&mut self) {
+        // SAFETY: this is the original successful getifaddrs allocation;
+        // unique ownership frees it exactly once, after all entry borrows end.
+        unsafe { libc::freeifaddrs(self.head.as_ptr()) };
+    }
+}
+
 #[derive(Debug, Default)]
 struct LinkAddresses {
     name: String,
@@ -115,21 +155,21 @@ struct LinkAddresses {
 /// renamed devices still map to the link that owns them.
 fn interface_addresses() -> HashMap<u32, LinkAddresses> {
     let mut result: HashMap<u32, LinkAddresses> = HashMap::new();
-    let mut head = std::ptr::null_mut();
-    if unsafe { libc::getifaddrs(&mut head) } != 0 {
+    let Some(list) = IfAddrs::read() else {
         return result;
-    }
+    };
     let mut entries = Vec::new();
     // AF_PACKET entries carry each link's kernel index, avoiding one
     // if_nametoindex socket per device on every background tick.
     let mut indexes: HashMap<String, Option<u32>> = HashMap::new();
-    let mut current = head;
-    while !current.is_null() {
-        let interface = unsafe { &*current };
+    for interface in list.iter() {
         if !interface.ifa_name.is_null() {
+            // SAFETY: libc supplies a null-terminated name in the live list.
             let label = unsafe { CStr::from_ptr(interface.ifa_name) }.to_string_lossy();
             let name = base_interface_name(&label).to_string();
             let address = interface.ifa_addr;
+            // SAFETY: a non-null ifa_addr is live and its family identifies
+            // the concrete sockaddr layout supplied by Linux getifaddrs.
             if !address.is_null() && unsafe { (*address).sa_family as i32 } == libc::AF_PACKET {
                 let link = unsafe { &*(address as *const libc::sockaddr_ll) };
                 if link.sll_ifindex > 0 {
@@ -137,11 +177,11 @@ fn interface_addresses() -> HashMap<u32, LinkAddresses> {
                 }
             }
             let loopback = interface.ifa_flags & libc::IFF_LOOPBACK as u32 != 0;
-            entries.push((name, loopback, socket_ip(address)));
+            // SAFETY: the address belongs to list, which remains live here.
+            entries.push((name, loopback, unsafe { socket_ip(address) }));
         }
-        current = interface.ifa_next;
     }
-    unsafe { libc::freeifaddrs(head) };
+    drop(list);
     for (name, loopback, ip) in entries {
         let index = *indexes
             .entry(name.clone())
@@ -163,7 +203,12 @@ fn interface_addresses() -> HashMap<u32, LinkAddresses> {
     result
 }
 
-fn socket_ip(address: *const libc::sockaddr) -> Option<IpAddr> {
+/// Copy an IP address without retaining any pointer into the libc list.
+///
+/// # Safety
+/// A non-null address must point to a live, aligned sockaddr whose family
+/// matches its complete initialized layout (sockaddr_in or sockaddr_in6 for IP).
+unsafe fn socket_ip(address: *const libc::sockaddr) -> Option<IpAddr> {
     if address.is_null() {
         return None;
     }
@@ -313,6 +358,38 @@ pub fn default_interface() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn socket_addresses_preserve_family_and_network_bytes() {
+        // SAFETY: null is explicitly accepted; each fixture below is live and
+        // aligned with the initialized layout selected by its family.
+        assert_eq!(unsafe { socket_ip(std::ptr::null()) }, None);
+        // These C structs contain only integer fields and pointers; zero is
+        // valid, and the matching family determines each concrete layout.
+        let mut unknown: libc::sockaddr = unsafe { std::mem::zeroed() };
+        unknown.sa_family = libc::AF_UNSPEC as libc::sa_family_t;
+        assert_eq!(unsafe { socket_ip(&raw const unknown) }, None);
+        let mut packet: libc::sockaddr_ll = unsafe { std::mem::zeroed() };
+        packet.sll_family = libc::AF_PACKET as libc::sa_family_t;
+        assert_eq!(unsafe { socket_ip((&raw const packet).cast()) }, None);
+
+        let ipv4_bytes = [192, 0, 2, 37];
+        let mut ipv4: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+        ipv4.sin_family = libc::AF_INET as libc::sa_family_t;
+        ipv4.sin_addr.s_addr = u32::from_ne_bytes(ipv4_bytes);
+        assert_eq!(
+            unsafe { socket_ip((&raw const ipv4).cast()) },
+            Some(IpAddr::V4(Ipv4Addr::from(ipv4_bytes)))
+        );
+        let ipv6_bytes = [0x20, 0x01, 0x0d, 0xb8, 0, 1, 0, 2, 0, 3, 0, 4, 0, 5, 0, 6];
+        let mut ipv6: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
+        ipv6.sin6_family = libc::AF_INET6 as libc::sa_family_t;
+        ipv6.sin6_addr.s6_addr = ipv6_bytes;
+        assert_eq!(
+            unsafe { socket_ip((&raw const ipv6).cast()) },
+            Some(IpAddr::V6(Ipv6Addr::from(ipv6_bytes)))
+        );
+    }
 
     #[test]
     fn alias_labels_map_to_their_device() {

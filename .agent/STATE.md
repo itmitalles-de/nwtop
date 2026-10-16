@@ -1,5 +1,22 @@
 # Verified state
 
+## getifaddrs ownership follow-up (2026-10-16)
+
+- Draft PR #23's CodeQL path starts at the old null initialization and omits
+  libc's successful output-pointer write. The same function already triggered
+  main alert #4 before moving (PR alert #5); no invalid access was established.
+- `IfAddrs` now owns the libc list, reads the output only after success and frees
+  it on drop, including unwinding. Entry borrows are bounded by that owner;
+  sockaddr decoding explicitly requires a live, correctly typed address.
+- Null/unknown/AF_PACKET and IPv4/IPv6 byte-order characterization passed before
+  and after. Formatting, Clippy and all 150 default Rust tests pass. A Rust 1.88
+  compiler control accepts copied data after release and rejects a surviving
+  entry borrow.
+- Capture, BPF, permissions and measurement rules are unchanged. No new local VM,
+  release build or optional-backend matrix was run; exact-head hosted checks,
+  including CodeQL, remain pending. No suppression or dismissal was added.
+- Evidence: `~/.codex/reports/refactoring-2026-10-15/nwtop/2026-10-16/`.
+
 ## Source refactoring #22 (2026-10-15)
 
 - Full tracked-file inventory and source-boundary decisions are in

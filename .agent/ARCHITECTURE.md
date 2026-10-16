@@ -46,7 +46,10 @@ UI translates; older helpers without notes keep working with English text, so
 the protocol version is unchanged.
 The UI itself never receives capabilities or elevated user IDs.
 
-`collector/interfaces.rs` reads `/proc/net/dev`, sysfs interface metadata and getifaddrs;
+`collector/interfaces.rs` reads `/proc/net/dev`, sysfs interface metadata and getifaddrs.
+Its private `IfAddrs` owner frees the libc list on drop and lends entries only
+while the allocation lives. Address decoding copies IP values before releasing
+the list; raw sockaddr access requires the documented family/layout contract.
 `collector.rs` owns sampling, worker orchestration, counters and attribution.
 Interface indexes come from `if_nametoindex`/AF_PACKET entries, never a 0
 fallback; IPv4 alias labels (`eth0:1`) map to their device, so VIPs are local.
