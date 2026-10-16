@@ -307,7 +307,9 @@ data. Interface totals and process totals can differ.
 
 ## Development
 
-nwtop is written in Rust. Build and run the core checks with:
+nwtop is written in Rust. The
+[source map and boundaries](.agent/ARCHITECTURE.md#source-inventory-and-refactoring-boundaries-22)
+describe the private modules behind the public API. Build and run the core checks with:
 
 ```bash
 cargo fmt --check
