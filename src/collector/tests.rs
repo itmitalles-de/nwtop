@@ -1,4 +1,8 @@
+use super::endpoints::socket_endpoints;
+use super::rows::link_in_scope;
+use super::status::{extended_status, pcap_status};
 use super::*;
+use crate::model::{CaptureStatus, ConnectionRow, ProcessRow};
 use packet::Protocol;
 
 fn interface(index: u32, loopback: bool, address: &str) -> KernelInterface {
@@ -592,4 +596,289 @@ fn selected_host_links_seed_only_host_sockets_but_keep_foreign_capture_counters(
     );
     let (host_lo, _) = attribution.rows(Some(1), &interfaces, now, 1.0, &attribution.deltas, true);
     assert!(!host_lo.iter().any(|r| r.pid == Some(200)));
+}
+
+#[test]
+fn disabled_capture_snapshots_report_status_and_kernel_rates() {
+    let mut collector = Collector::new(false).unwrap();
+    for interface in [None, Some("lo")] {
+        let snapshot = collector.sample(interface).unwrap();
+        let status = &snapshot.capture;
+        assert!(!status.active);
+        assert_eq!(status.dropped, 0);
+        assert_eq!(status.notes.first(), Some(&CaptureNote::Disabled));
+        assert!(status.notes[1..].iter().all(|note| matches!(
+            note,
+            CaptureNote::OwnersInaccessible | CaptureNote::CounterLimit
+        )));
+        assert_eq!(
+            status.message,
+            Lang::En.capture_status(status, true).unwrap_or_default()
+        );
+        // Without capture, listed sockets have no measured rates.
+        assert!(
+            snapshot
+                .processes
+                .iter()
+                .all(|row| row.rx_rate == 0.0 && row.tx_rate == 0.0)
+        );
+        assert!(
+            snapshot
+                .connections
+                .iter()
+                .all(|row| row.rx_rate == 0.0 && row.tx_rate == 0.0)
+        );
+        assert!(
+            snapshot
+                .interfaces
+                .iter()
+                .all(|interface| interface.rx_rate >= 0.0 && interface.tx_rate >= 0.0)
+        );
+        // The next interval starts from exactly these kernel counters.
+        assert_eq!(
+            collector.previous_interfaces.len(),
+            snapshot.interfaces.len()
+        );
+        for interface in &snapshot.interfaces {
+            let (_, rx, tx) = collector.previous_interfaces[&interface.name];
+            assert_eq!((rx, tx), (interface.rx_bytes, interface.tx_bytes));
+        }
+    }
+}
+
+#[test]
+fn row_totals_rates_scope_and_order_are_stable() {
+    let now = Instant::now();
+    let mut attribution = Attribution::new(Inventory::new(), None);
+    let host = attribution.inventory.host_namespace();
+    let socket = |inode: u64, pid: u32, local: &str, remote: &str, current: bool| Socket {
+        key: SocketKey {
+            namespace: host,
+            inode,
+            protocol: Protocol::Tcp,
+            local: local.parse().unwrap(),
+            remote: remote.parse().unwrap(),
+        },
+        state: "ESTABLISHED".to_string(),
+        uid: 0,
+        observed: now,
+        current,
+        ipv6_only: None,
+        owners: vec![Owner {
+            identity: ProcessIdentity { pid, start_time: 1 },
+            user: "root".to_string(),
+            name: format!("p{pid}"),
+        }],
+    };
+    let listed = socket(1, 10, "192.0.2.1:1000", "198.51.100.1:443", true);
+    let closed = socket(2, 20, "192.0.2.1:2000", "198.51.100.1:443", false);
+    let mut ownerless = socket(3, 30, "192.0.2.1:3000", "198.51.100.1:443", true);
+    ownerless.owners.clear();
+    attribution
+        .inventory
+        .sockets
+        .extend([listed.clone(), ownerless]);
+    let mut deltas = Deltas::default();
+    for (link, socket, bytes) in [
+        (1, &listed, Bytes { rx: 100, tx: 50 }),
+        (2, &listed, Bytes { rx: 7, tx: 0 }),
+        (1, &closed, Bytes { rx: 300, tx: 0 }),
+    ] {
+        assert!(attribution.counters.record_owned(
+            Link::plain(link),
+            socket,
+            true,
+            bytes,
+            now,
+            &mut deltas
+        ));
+    }
+    attribution.counters.record_unknown(
+        Link::plain(1),
+        Bytes { rx: 5, tx: 6 },
+        now,
+        &mut deltas.unknown,
+    );
+    let interfaces = [
+        interface(1, false, "192.0.2.1"),
+        interface(2, false, "192.0.2.1"),
+    ];
+    let summary = |(processes, connections): (Vec<ProcessRow>, Vec<ConnectionRow>)| {
+        (
+            processes
+                .iter()
+                .map(|r| {
+                    format!(
+                        "{:?} {} {} {} {} {} {} {}",
+                        r.pid,
+                        r.name,
+                        r.connections,
+                        r.rx_bytes,
+                        r.tx_bytes,
+                        r.rx_rate,
+                        r.tx_rate,
+                        r.user
+                    )
+                })
+                .collect::<Vec<_>>(),
+            connections
+                .iter()
+                .map(|r| {
+                    format!(
+                        "{:?} {} {} {} {} {} {} {}",
+                        r.pid,
+                        r.local,
+                        r.state,
+                        r.rx_bytes,
+                        r.tx_bytes,
+                        r.rx_rate,
+                        r.tx_rate,
+                        r.process
+                    )
+                })
+                .collect::<Vec<_>>(),
+        )
+    };
+    let later = now + RECENT_TRAFFIC + Duration::from_secs(1);
+    let all = summary(attribution.rows(None, &interfaces, now, 2.0, &deltas, true));
+    assert_eq!(
+        all,
+        (
+            vec![
+                "Some(20) p20 0 300 0 150 0 root".to_string(),
+                "Some(10) p10 1 107 50 53.5 25 root".to_string(),
+                "None [unattributed] 1 5 6 2.5 3 -".to_string(),
+            ],
+            vec![
+                "Some(20) 192.0.2.1:2000 RECENT/CLOSED 300 0 150 0 p20".to_string(),
+                "Some(10) 192.0.2.1:1000 ESTABLISHED 107 50 53.5 25 p10".to_string(),
+                "None 192.0.2.1:3000 ESTABLISHED 0 0 0 0 [unknown]".to_string(),
+            ],
+        )
+    );
+    let selected = summary(attribution.rows(Some(2), &interfaces, now, 2.0, &deltas, false));
+    assert_eq!(
+        selected,
+        (
+            vec![
+                "None [unattributed] 1 0 0 0 0 -".to_string(),
+                "Some(10) p10 1 7 0 0 0 root".to_string(),
+            ],
+            vec![
+                "None 192.0.2.1:3000 ESTABLISHED 0 0 0 0 [unknown]".to_string(),
+                "Some(10) 192.0.2.1:1000 ESTABLISHED 7 0 0 0 p10".to_string(),
+            ],
+        )
+    );
+    let quiet = summary(attribution.rows(None, &interfaces, later, 2.0, &Deltas::default(), true));
+    assert_eq!(
+        quiet,
+        (
+            vec![
+                "None [unattributed] 1 5 6 0 0 -".to_string(),
+                "Some(10) p10 1 107 50 0 0 root".to_string(),
+            ],
+            vec![
+                "None 192.0.2.1:3000 ESTABLISHED 0 0 0 0 [unknown]".to_string(),
+                "Some(10) 192.0.2.1:1000 ESTABLISHED 107 50 0 0 p10".to_string(),
+            ],
+        )
+    );
+}
+
+#[test]
+fn pcap_status_reports_scope_interval_problems_and_stops() {
+    let start = || CaptureStatus {
+        active: true,
+        notes: vec![CaptureNote::Disabled],
+        ..CaptureStatus::default()
+    };
+    let quiet = IntervalStatus::default();
+    let mut status = start();
+    pcap_status(&mut status, &quiet, false, false, None, None);
+    assert!(status.active);
+    assert_eq!(status.notes, vec![CaptureNote::AllInterfaces]);
+    let mut status = start();
+    pcap_status(&mut status, &quiet, true, false, None, None);
+    assert!(!status.active);
+    assert_eq!(status.notes, vec![CaptureNote::NoInterfaceIndexes]);
+    let problems = IntervalStatus {
+        timestamp_invalid: 9,
+        dropped: 1,
+        overflow: 2,
+        attribution_overflow: 3,
+        unsupported: 0,
+        truncated: 4,
+    };
+    let mut status = start();
+    pcap_status(&mut status, &problems, true, true, Some("worker"), None);
+    assert!(status.active);
+    assert_eq!(status.dropped, 3);
+    assert_eq!(
+        status.notes,
+        vec![
+            CaptureNote::Sampled,
+            CaptureNote::PcapMissed { packets: 1 },
+            CaptureNote::CaptureQueueLimit { packets: 2 },
+            CaptureNote::AttributionQueueLimit { packets: 3 },
+            CaptureNote::Unreadable {
+                unsupported: 0,
+                truncated: 4,
+            },
+            CaptureNote::AttributionAtRefresh {
+                error: "worker".into(),
+            },
+        ]
+    );
+    let mut status = start();
+    pcap_status(
+        &mut status,
+        &problems,
+        false,
+        true,
+        Some("worker"),
+        Some("gone"),
+    );
+    assert!(!status.active);
+    assert_eq!(status.dropped, 3);
+    assert_eq!(
+        status.notes,
+        vec![CaptureNote::Stopped {
+            error: "gone".into()
+        }]
+    );
+}
+
+#[test]
+fn extended_status_lists_issues_and_consumes_unconfirmed_flows() {
+    let mut extended = extended::Extended::empty_for_test();
+    extended.issues = vec!["conntrack: initial synchronization pending".into()];
+    extended.unconfirmed.set(true);
+    let mut status = CaptureStatus {
+        active: true,
+        notes: vec![CaptureNote::AllInterfaces, CaptureNote::Sampled],
+        ..CaptureStatus::default()
+    };
+    let problems = IntervalStatus {
+        timestamp_invalid: 2,
+        ..IntervalStatus::default()
+    };
+    extended_status(&mut status, &extended, &problems, true);
+    assert!(status.active);
+    assert!(!extended.unconfirmed.get());
+    assert_eq!(
+        status.notes,
+        vec![
+            CaptureNote::AllInterfaces,
+            CaptureNote::Sampled,
+            CaptureNote::ExtendedIssue {
+                detail: "conntrack: initial synchronization pending".into()
+            },
+            CaptureNote::ExtendedIssue {
+                detail: "no confirmed conntrack entry for some flows; only positive socket events can attribute them".into()
+            },
+        ]
+    );
+    extended_status(&mut status, &extended, &problems, true);
+    assert_eq!(status.notes.len(), 5);
 }

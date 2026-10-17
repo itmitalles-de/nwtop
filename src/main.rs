@@ -150,8 +150,104 @@ fn runtime_settings(args: &Args, saved: &Settings, no_color_env: bool) -> Settin
 fn main() -> Result<()> {
     let args = Args::parse();
     let shutdown = SignalGuard::new().context("registering shutdown handlers")?;
+    let StartupSettings {
+        config,
+        saved,
+        mut settings,
+        mut notices,
+    } = startup_settings(&args)?;
+    if !cfg!(target_os = "linux") && !args.demo {
+        bail!("live monitoring requires Linux");
+    }
+    let mut helper_error = None;
+    let mut source = initial_source(&args, &mut helper_error)?;
+    let automatic_interface = if args.demo {
+        Some("enp112s0".into())
+    } else {
+        default_interface()
+    };
+    let mut interface = configured_interface(
+        settings.interface.as_deref(),
+        automatic_interface.as_deref(),
+    );
+    let Some((first, fallback_notice)) = first_snapshot(
+        &mut source,
+        &mut interface,
+        args.interface.is_some(),
+        automatic_interface.as_deref(),
+        &shutdown,
+        &mut helper_error,
+    )?
+    else {
+        return Ok(());
+    };
+    if let Some(notice) = fallback_notice {
+        notices.push(notice);
+        // Only this run falls back; F12 keeps the saved choice unless changed.
+        settings.interface = None;
+    }
+    if !first.capture.active
+        && let Some(error) = helper_error
+    {
+        eprintln!("Capture setup: {error:#}. Run scripts/setup-capture.sh once; see README.");
+    }
+    if args.once || args.json {
+        return print_once(
+            &mut source,
+            interface.as_deref(),
+            &settings,
+            &args,
+            &shutdown,
+        );
+    }
+    if !io::stdout().is_terminal() || !io::stdin().is_terminal() {
+        bail!("interactive mode needs a terminal; use --once or --json for non-interactive output");
+    }
+    let mut app = interactive_app(
+        interface,
+        settings,
+        saved,
+        args.demo,
+        automatic_interface,
+        &notices,
+    );
+    app.update(first);
+    run_terminal(&mut source, &mut app, config.as_ref(), &shutdown)
+}
+
+/// Saved and effective settings for this run, with notices about the file.
+struct StartupSettings {
+    config: Option<ConfigFile>,
+    saved: Settings,
+    settings: Settings,
+    notices: Vec<Notice>,
+}
+
+/// Load saved settings, apply this run's overrides and validate the result.
+/// Settings notices go to stderr in English once the result is valid.
+fn startup_settings(args: &Args) -> Result<StartupSettings> {
+    let (config, saved, notices) = load_saved_settings(ConfigFile::discover());
+    let no_color_env = std::env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty());
+    let settings = runtime_settings(args, &saved, no_color_env);
+    settings.validate()?;
+    for notice in &notices {
+        eprintln!("{}", notice.text(Lang::En));
+    }
+    Ok(StartupSettings {
+        config,
+        saved,
+        settings,
+        notices,
+    })
+}
+
+/// A missing location or an unreadable or malformed settings file never
+/// prevents monitoring: defaults apply and the problem becomes a notice.
+fn load_saved_settings(
+    discovered: Result<ConfigFile>,
+) -> (Option<ConfigFile>, Settings, Vec<Notice>) {
     let mut notices = Vec::new();
-    let config = match ConfigFile::discover() {
+    let config = match discovered {
         Ok(config) => Some(config),
         Err(error) => {
             notices.push(Notice::Settings(format!("{error:#}")));
@@ -175,17 +271,14 @@ fn main() -> Result<()> {
             Settings::default()
         }
     };
-    let no_color_env = std::env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty());
-    let mut settings = runtime_settings(&args, &saved, no_color_env);
-    settings.validate()?;
-    for notice in &notices {
-        eprintln!("{}", notice.text(Lang::En));
-    }
-    if !cfg!(target_os = "linux") && !args.demo {
-        bail!("live monitoring requires Linux");
-    }
-    let mut helper_error = None;
-    let mut source = if args.demo {
+    (config, saved, notices)
+}
+
+/// Demo data, the unprivileged capture helper, or direct collection. A
+/// helper that cannot start is replaced by direct counters and its error is
+/// kept for the setup hint.
+fn initial_source(args: &Args, helper_error: &mut Option<anyhow::Error>) -> Result<Source> {
+    Ok(if args.demo {
         Source::Demo {
             tick: 0,
             start: Instant::now(),
@@ -194,7 +287,7 @@ fn main() -> Result<()> {
         match Client::start() {
             Ok(client) => Source::Helper(client),
             Err(error) => {
-                helper_error = Some(error);
+                *helper_error = Some(error);
                 Source::Live(Box::new(Collector::new(true)?))
             }
         }
@@ -202,100 +295,147 @@ fn main() -> Result<()> {
         Source::Live(Box::new(
             Collector::new(!args.no_capture).context("cannot initialize Linux network counters")?,
         ))
-    };
-    let automatic_interface = if args.demo {
-        Some("enp112s0".into())
-    } else {
-        default_interface()
-    };
-    let mut interface = match settings.interface.as_deref() {
+    })
+}
+
+/// The interface selected by settings; `all` means every interface and no
+/// choice means the automatic default.
+fn configured_interface(setting: Option<&str>, automatic: Option<&str>) -> Option<String> {
+    match setting {
         Some("all") => None,
         Some(name) => Some(name.to_string()),
-        None => automatic_interface.clone(),
-    };
-    let Some(mut first) = startup_sample(
-        &mut source,
+        None => automatic.map(str::to_string),
+    }
+}
+
+/// The first snapshot. An explicitly requested interface must exist; a saved
+/// one that does not falls back to `automatic` for this run and returns the
+/// notice. `None` means shutdown was requested meanwhile.
+fn first_snapshot(
+    source: &mut Source,
+    interface: &mut Option<String>,
+    explicit: bool,
+    automatic: Option<&str>,
+    shutdown: &SignalGuard,
+    helper_error: &mut Option<anyhow::Error>,
+) -> Result<Option<(Snapshot, Option<Notice>)>> {
+    let Some(first) = startup_sample(
+        source,
         interface.as_deref(),
-        &shutdown,
-        &mut helper_error,
+        shutdown,
+        helper_error,
         direct_collector,
     )?
     else {
-        return Ok(());
+        return Ok(None);
     };
-    if let Some(name) = &interface
-        && !first.interfaces.iter().any(|iface| &iface.name == name)
-    {
-        if args.interface.is_some() {
-            bail!(
-                "interface {name:?} does not exist; available: {}",
-                first
-                    .interfaces
-                    .iter()
-                    .map(|iface| iface.name.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            );
-        }
-        let notice = Notice::InterfaceUnavailable(name.clone());
-        eprintln!("{}", notice.text(Lang::En));
-        notices.push(notice);
-        // Only this run falls back; F12 keeps the saved choice unless changed.
-        settings.interface = None;
-        interface = automatic_interface.clone();
-        let Some(retry) = startup_sample(
-            &mut source,
-            interface.as_deref(),
-            &shutdown,
-            &mut helper_error,
-            direct_collector,
-        )?
-        else {
-            return Ok(());
-        };
-        first = retry;
+    let Some(name) = missing_interface(interface.as_deref(), &first) else {
+        return Ok(Some((first, None)));
+    };
+    if explicit {
+        return Err(unknown_interface(name, &first));
     }
-    if !first.capture.active
-        && let Some(error) = helper_error
-    {
-        eprintln!("Capture setup: {error:#}. Run scripts/setup-capture.sh once; see README.");
-    }
-    if args.once || args.json {
-        let deadline = Instant::now() + Duration::from_millis(settings.interval_ms);
-        while Instant::now() < deadline {
-            if shutdown.requested() {
-                return Ok(());
-            }
-            std::thread::sleep(
-                deadline
-                    .saturating_duration_since(Instant::now())
-                    .min(Duration::from_millis(100)),
-            );
-        }
-        let snapshot = match source.sample(interface.as_deref(), &shutdown) {
-            Err(_) if shutdown.requested() => return Ok(()),
-            result => result?,
-        };
-        let mut stdout = io::stdout().lock();
-        let written = if args.json {
-            let json = serde_json::to_string_pretty(&snapshot)?;
-            writeln!(stdout, "{json}")
-        } else {
-            print_snapshot(
-                &mut stdout,
-                &snapshot,
-                interface.as_deref(),
-                settings.bits,
-                args.demo,
-            )
-        };
-        ignore_closed_output(written.and_then(|()| stdout.flush()))?;
+    let notice = Notice::InterfaceUnavailable(name.to_string());
+    eprintln!("{}", notice.text(Lang::En));
+    *interface = automatic.map(str::to_string);
+    let retry = startup_sample(
+        source,
+        interface.as_deref(),
+        shutdown,
+        helper_error,
+        direct_collector,
+    )?;
+    Ok(retry.map(|snapshot| (snapshot, Some(notice))))
+}
+
+/// The selected interface if the snapshot does not contain it.
+fn missing_interface<'a>(interface: Option<&'a str>, snapshot: &Snapshot) -> Option<&'a str> {
+    interface.filter(|name| !snapshot.interfaces.iter().any(|iface| iface.name == *name))
+}
+
+fn unknown_interface(name: &str, snapshot: &Snapshot) -> anyhow::Error {
+    anyhow::anyhow!(
+        "interface {name:?} does not exist; available: {}",
+        snapshot
+            .interfaces
+            .iter()
+            .map(|iface| iface.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
+/// `--once` and `--json`: wait one refresh interval, then print a snapshot.
+fn print_once(
+    source: &mut Source,
+    interface: Option<&str>,
+    settings: &Settings,
+    args: &Args,
+    shutdown: &SignalGuard,
+) -> Result<()> {
+    if !wait_interval(Duration::from_millis(settings.interval_ms), shutdown) {
         return Ok(());
     }
-    if !io::stdout().is_terminal() || !io::stdin().is_terminal() {
-        bail!("interactive mode needs a terminal; use --once or --json for non-interactive output");
+    let snapshot = match source.sample(interface, shutdown) {
+        Err(_) if shutdown.requested() => return Ok(()),
+        result => result?,
+    };
+    write_output(
+        &mut io::stdout().lock(),
+        &snapshot,
+        interface,
+        settings.bits,
+        args.demo,
+        args.json,
+    )
+}
+
+/// Sleep for `interval` in short steps; `false` if shutdown was requested.
+fn wait_interval(interval: Duration, shutdown: &SignalGuard) -> bool {
+    let deadline = Instant::now() + interval;
+    while Instant::now() < deadline {
+        if shutdown.requested() {
+            return false;
+        }
+        std::thread::sleep(
+            deadline
+                .saturating_duration_since(Instant::now())
+                .min(Duration::from_millis(100)),
+        );
     }
-    let mut app = App::with_saved(interface, settings, saved, args.demo);
+    true
+}
+
+/// Write one snapshot as pretty JSON or as the text table, then flush.
+fn write_output(
+    out: &mut impl Write,
+    snapshot: &Snapshot,
+    interface: Option<&str>,
+    bits: bool,
+    demo: bool,
+    json: bool,
+) -> Result<()> {
+    let written = if json {
+        let json = serde_json::to_string_pretty(snapshot)?;
+        writeln!(out, "{json}")
+    } else {
+        print_snapshot(out, snapshot, interface, bits, demo)
+    };
+    ignore_closed_output(written.and_then(|()| out.flush()))?;
+    Ok(())
+}
+
+/// The monitor state before its first sample; startup notices are shown in
+/// the UI language.
+fn interactive_app(
+    interface: Option<String>,
+    settings: Settings,
+    saved: Settings,
+    demo: bool,
+    automatic_interface: Option<String>,
+    notices: &[Notice],
+) -> App {
+    let mut app = App::with_saved(interface, settings, saved, demo);
     app.system_lang = Lang::system();
     app.auto_interface = automatic_interface;
     if !notices.is_empty() {
@@ -308,23 +448,23 @@ fn main() -> Result<()> {
                 .join(" | "),
         );
     }
-    app.update(first);
+    app
+}
+
+/// Own the terminal for the interactive monitor and restore it afterwards.
+fn run_terminal(
+    source: &mut Source,
+    app: &mut App,
+    config: Option<&ConfigFile>,
+    shutdown: &SignalGuard,
+) -> Result<()> {
     // Color policy is applied to the whole buffer by the UI, so changing it in
     // Setup can also reset previously colored cells and override NO_COLOR.
     crossterm::style::force_color_output(true);
     let mut terminal = ratatui::init();
     let result = Events::start()
         .context("starting terminal input")
-        .and_then(|events| {
-            run(
-                &mut terminal,
-                &mut source,
-                &mut app,
-                config.as_ref(),
-                &shutdown,
-                &events,
-            )
-        });
+        .and_then(|events| run(&mut terminal, source, app, config, shutdown, &events));
     let restored = ratatui::try_restore();
     let cursor = terminal.show_cursor();
     // ratatui reports restore and cursor errors (the latter when dropping the
@@ -698,5 +838,188 @@ mod tests {
             .is_err()
         );
         assert!(helper_error.is_none());
+    }
+
+    fn demo_source() -> Source {
+        Source::Demo {
+            tick: 0,
+            start: Instant::now(),
+        }
+    }
+
+    #[test]
+    fn configured_interface_maps_all_and_automatic_selection() {
+        assert_eq!(configured_interface(Some("all"), Some("eth0")), None);
+        assert_eq!(
+            configured_interface(Some("lo"), Some("eth0")).as_deref(),
+            Some("lo")
+        );
+        assert_eq!(
+            configured_interface(None, Some("eth0")).as_deref(),
+            Some("eth0")
+        );
+        assert_eq!(configured_interface(None, None), None);
+    }
+
+    #[test]
+    fn missing_interfaces_are_named_with_the_available_ones() {
+        let snapshot = ui::demo_snapshot(1, 1.0);
+        assert_eq!(missing_interface(Some("enp112s0"), &snapshot), None);
+        assert_eq!(missing_interface(None, &snapshot), None);
+        assert_eq!(missing_interface(Some("eth9"), &snapshot), Some("eth9"));
+        assert_eq!(
+            unknown_interface("eth9", &snapshot).to_string(),
+            "interface \"eth9\" does not exist; available: enp112s0, tailscale0, lo"
+        );
+    }
+
+    #[test]
+    fn first_snapshot_rejects_explicit_and_replaces_saved_missing_interfaces() {
+        let shutdown = SignalGuard::new().unwrap();
+        let mut helper_error = None;
+        let mut source = demo_source();
+        let mut interface = Some("lo".to_string());
+        let (_, notice) = first_snapshot(
+            &mut source,
+            &mut interface,
+            true,
+            Some("enp112s0"),
+            &shutdown,
+            &mut helper_error,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(notice.is_none());
+        assert_eq!(interface.as_deref(), Some("lo"));
+
+        let mut interface = Some("eth9".to_string());
+        let error = first_snapshot(
+            &mut source,
+            &mut interface,
+            true,
+            Some("enp112s0"),
+            &shutdown,
+            &mut helper_error,
+        )
+        .err()
+        .unwrap();
+        assert!(error.to_string().starts_with("interface \"eth9\" does not"));
+        assert_eq!(interface.as_deref(), Some("eth9"));
+
+        let (_, notice) = first_snapshot(
+            &mut source,
+            &mut interface,
+            false,
+            Some("enp112s0"),
+            &shutdown,
+            &mut helper_error,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            notice.unwrap().text(Lang::En),
+            "Saved interface eth9 unavailable; using automatic selection"
+        );
+        assert_eq!(interface.as_deref(), Some("enp112s0"));
+        assert!(helper_error.is_none());
+    }
+
+    #[test]
+    fn unusable_settings_files_become_notices_with_defaults() {
+        use std::os::unix::fs::DirBuilderExt;
+        let directory =
+            std::env::temp_dir().join(format!("nwtop-main-settings-test-{}", std::process::id()));
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&directory)
+            .unwrap();
+        let path = directory.join("nwtop/config.json");
+
+        let (config, saved, notices) = load_saved_settings(Err(anyhow::anyhow!("HOME unset")));
+        assert!(config.is_none());
+        assert_eq!(saved, Settings::default());
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices[0].text(Lang::En), "Settings: HOME unset");
+
+        let (config, saved, notices) = load_saved_settings(Ok(ConfigFile::at(path.clone())));
+        assert_eq!(config.unwrap().path(), path);
+        assert_eq!(saved, Settings::default());
+        assert!(notices.is_empty());
+
+        ConfigFile::at(path.clone())
+            .save(&Settings::default())
+            .unwrap();
+        std::fs::write(&path, r#"{"bits":true,"colour":false}"#).unwrap();
+        let (_, saved, notices) = load_saved_settings(Ok(ConfigFile::at(path.clone())));
+        assert!(saved.bits);
+        assert_eq!(notices.len(), 1);
+        assert!(matches!(&notices[0], Notice::UnknownKeys(keys) if keys == &["colour"]));
+
+        std::fs::write(&path, "invalid").unwrap();
+        let (config, saved, notices) = load_saved_settings(Ok(ConfigFile::at(path.clone())));
+        assert!(config.is_some());
+        assert_eq!(saved, Settings::default());
+        assert_eq!(notices.len(), 1);
+        assert!(
+            notices[0]
+                .text(Lang::En)
+                .starts_with("Settings: cannot load ")
+        );
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn single_snapshots_print_as_json_or_text() {
+        let snapshot = ui::demo_snapshot(1, 1.0);
+        let mut json = Vec::new();
+        write_output(&mut json, &snapshot, Some("lo"), false, true, true).unwrap();
+        let json = String::from_utf8(json).unwrap();
+        assert_eq!(
+            json,
+            format!("{}\n", serde_json::to_string_pretty(&snapshot).unwrap())
+        );
+        let mut text = Vec::new();
+        write_output(&mut text, &snapshot, Some("lo"), true, true, false).unwrap();
+        let mut expected = Vec::new();
+        print_snapshot(&mut expected, &snapshot, Some("lo"), true, true).unwrap();
+        assert_eq!(text, expected);
+        let shutdown = SignalGuard::new().unwrap();
+        assert!(wait_interval(Duration::ZERO, &shutdown));
+    }
+
+    #[test]
+    fn startup_notices_are_joined_in_the_interactive_app() {
+        let settings = Settings {
+            language: nwtop::config::Language::En,
+            ..Settings::default()
+        };
+        let notices = [
+            Notice::Settings("broken".into()),
+            Notice::InterfaceUnavailable("eth9".into()),
+        ];
+        let app = interactive_app(
+            Some("lo".into()),
+            settings.clone(),
+            settings,
+            true,
+            Some("enp112s0".into()),
+            &notices,
+        );
+        assert_eq!(app.interface.as_deref(), Some("lo"));
+        assert_eq!(app.auto_interface.as_deref(), Some("enp112s0"));
+        assert!(app.notice_error);
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("Settings: broken | Saved interface eth9 unavailable; using automatic selection")
+        );
+        let app = interactive_app(
+            None,
+            Settings::default(),
+            Settings::default(),
+            true,
+            None,
+            &[],
+        );
+        assert!(app.notice.is_none());
     }
 }

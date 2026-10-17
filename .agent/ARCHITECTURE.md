@@ -205,22 +205,26 @@ The 2026-10-15 pass inventoried all 73 tracked files at `f598a26`, including
 installers, CI and the static site. File size alone does not justify splitting
 an evidence state machine: much of the large attribution files is regression
 coverage. No dependencies, wire schemas, thresholds or measurements changed.
+The 2026-10-17 second pass moved the collector-only attribution modules under
+`src/collector/` (no `#[path]` for them), split them by concern and decomposed
+the longest functions into named helpers; every module stays private.
 
 | Source boundary | Responsibility and decision |
 | --- | --- |
-| `ui.rs` | Public facade, input, filtering, sorting and runtime preferences; 2,435 lines became 674 after extracting rendering and tests. |
-| `ui/render.rs`, `ui/render/{graph,overlays}.rs` | Main layout, history plots and modal panels; consume the existing `App` state without changing keys, text, colors or dimensions. |
+| `ui.rs` | Public facade, input, filtering, sorting and runtime preferences; 2,435 lines became 674 after extracting rendering and tests. Key handling dispatches global keys, then `search_key`/`monitor_key`. |
+| `ui/render.rs`, `ui/render/{graph,overlays}.rs` | Main layout, history plots and modal panels; consume the existing `App` state without changing keys, text, colors or dimensions. Table columns, step-graph paths/labels, Setup categories/option rows and Help text are separate helpers. |
 | `ui/{format,demo}.rs` | Shared display units and explicit preview data; existing `ui` exports are preserved. |
 | `config.rs`, `config/settings.rs` | Private atomic file operations separated from schema/defaults/validation. Symlink, ownership, hardlink and size checks stay in the file boundary. |
-| `collector.rs`, `collector/interfaces.rs` | Attribution/counters separated from host counters, addresses, topology and default-route discovery. Worker timing and scope rules stay together in the collector. |
+| `collector.rs`, `collector/interfaces.rs` | Snapshot sampling, worker timing, counters and per-flow attribution separated from host counters, addresses, topology and default-route discovery. |
+| `collector/{endpoints,rows,status}.rs` | Flow endpoint locality (`LocalView`, loopback, lower links, docker-proxy rule); process/connection row building and scope rules; per-snapshot capture status notes. |
 | `sockets.rs`, `sockets/{procfs,diagnostics}.rs` | Inventory and conservative endpoint resolution separated from bounded Linux metadata reads and host-only SOCK_DIAG transport/retry. PID identity, ambiguity, retention and limits are unchanged. |
 | `conntrack.rs`, `conntrack/codec.rs` | Cache generations, quarantine and worker I/O remain together; pure netlink validation produces metadata without I/O or cache writes. |
-| `event_owners.rs` | Keep the cohesive bounded evidence-window/actor/namespace state machine and its extensive adversarial tests. |
-| `extended.rs` | Keep event, descriptor, packet and NAT evidence orchestration together; its ownership decisions share state. |
-| `events.rs` | Keep the feature-gated libbpf ABI, attach order, owning worker and loss accounting together. |
-| `capture.rs` | Keep the owning pcap lifecycle, capability boundary, fragment quarantine, bounded queues and clock conversion. |
-| `packet.rs`, `links.rs` | Already separate bounded packet parsing and route-netlink link discovery. |
-| `main.rs` | Keep CLI overrides, helper fallback, terminal lifetime and event-loop integration. |
+| `collector/event_owners.rs`, `event_owners/{ingest,lookup}.rs` | One bounded evidence-window/actor/namespace state: shared types, limits and quarantine in the parent; event intake and index rebuild in `ingest`; packet/flow queries in `lookup`. Event kinds and flags are named after `bpf/lifecycle.bpf.c`. Adversarial tests in `event_owners/tests.rs`. |
+| `collector/extended.rs`, `extended/owner_index.rs` | Event, descriptor, packet and NAT evidence orchestration stays together; the current descriptor-owner index (veto and corroboration) is separate. Tests in `extended/tests.rs`. |
+| `events.rs` | Keep the feature-gated libbpf ABI, attach order, owning worker and loss accounting together (`bpf/README.md` names this path); session opening is split into load, ring, ordering, attach and arm steps. |
+| `capture.rs` | Keep the owning pcap lifecycle, capability boundary, fragment quarantine, bounded queues and clock conversion; the worker loop (`pump`, `read_burst`, `DropCounter`) is separate from session start-up. |
+| `packet.rs`, `links.rs` | Already separate bounded packet parsing and route-netlink link discovery; parsing is split into link, IPv4 and IPv6 header steps. |
+| `main.rs` | Keep CLI overrides, helper fallback, terminal lifetime and event-loop integration; `main` delegates settings, source, first snapshot, single output and terminal phases in their original order. |
 | `helper.rs`, `bin/nwtop-collector.rs`, `privilege.rs` | Keep the bounded protocol and privileged entry point/capability operations separate from UI and configuration. |
 | `input.rs`, `shutdown.rs` | Small existing event and cooperative signal lifetime boundaries. |
 | `model.rs`, `i18n.rs`, `lib.rs` | Public snapshot schema, language text and crate surface remain unchanged. |
@@ -234,6 +238,16 @@ all existing safety cases. `tests/ui_contract.rs` records 48 deterministic full
 terminal buffers, including symbols, colors and modifiers, through the public
 API before the renderer split: both languages, narrow/wide terminals, all
 panels, both chart styles, connections, search and unavailable capture.
+
+The second pass first added characterization tests where coverage was missing:
+full-buffer hashes for table breakpoints, edge-case graphs, every Setup row and
+Help scroll state, a key-handling state trace, row totals/rates/order, and
+status notes. Temporary differential tests (not kept) compared the refactored
+`event_owners`, `extended` and `packet::parse` against the previous code on
+randomized inputs. The remaining `#[path]` mounts in `collector.rs` (`capture`,
+`conntrack`, `events`, `links`, `packet`, `sockets`) were left in place:
+`bpf/README.md` names `src/events.rs`, and relocating the others alone adds no
+clarity.
 
 Compiler/Clippy checks found no dead-code warning in either feature mode.
 Similar parsers intentionally follow different procfs, packet and netlink wire

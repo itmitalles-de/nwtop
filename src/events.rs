@@ -311,21 +311,13 @@ mod enabled {
             return false;
         }
         let available = MAX_EVENTS.saturating_sub(shared.events.len() + shared.packets.len());
-        let accepted = staged.events.len().min(available);
-        shared.lost = shared
-            .lost
-            .saturating_add((staged.events.len() - accepted) as u64);
-        shared.losses.0[5] =
-            shared.losses.0[5].saturating_add((staged.events.len() - accepted) as u64);
-        shared.events.extend(staged.events.drain(..accepted));
-        staged.events.clear();
-        let available = MAX_EVENTS.saturating_sub(shared.events.len() + shared.packets.len());
-        let accepted = staged.packets.len().min(available);
-        let dropped = (staged.packets.len() - accepted) as u64;
+        let dropped = admit(&mut staged.events, &mut shared.events, available);
         shared.lost = shared.lost.saturating_add(dropped);
         shared.losses.0[5] = shared.losses.0[5].saturating_add(dropped);
-        shared.packets.extend(staged.packets.drain(..accepted));
-        staged.packets.clear();
+        let available = MAX_EVENTS.saturating_sub(shared.events.len() + shared.packets.len());
+        let dropped = admit(&mut staged.packets, &mut shared.packets, available);
+        shared.lost = shared.lost.saturating_add(dropped);
+        shared.losses.0[5] = shared.losses.0[5].saturating_add(dropped);
         if previous_size < MAX_EVENTS / 4
             && shared.events.len() + shared.packets.len() >= MAX_EVENTS / 4
             && let Some(wake) = wake
@@ -333,6 +325,16 @@ mod enabled {
             wake.notify();
         }
         true
+    }
+
+    /// Move at most `available` staged records to the shared queue, emptying
+    /// the staging queue, and return how many records were dropped.
+    fn admit<T>(staged: &mut Vec<T>, shared: &mut Vec<T>, available: usize) -> u64 {
+        let accepted = staged.len().min(available);
+        let dropped = (staged.len() - accepted) as u64;
+        shared.extend(staged.drain(..accepted));
+        staged.clear();
+        dropped
     }
 
     #[repr(C)]
@@ -401,6 +403,9 @@ mod enabled {
     }
 
     impl Session {
+        /// Load, attach and arm the embedded object. A failure after the
+        /// object is opened drops the partial session, which detaches every
+        /// link already attached and frees the ring and object.
         fn open() -> Result<Self> {
             let api = Api::load()?;
             let object = api.pointer(
@@ -418,38 +423,61 @@ mod enabled {
                     polled: 0,
                 }),
             };
-            let loaded = unsafe { (session.api.load)(session.object) };
+            session.load()?;
+            session.open_ring()?;
+            let programs = session.programs_in_attachment_order()?;
+            session.attach(&programs)?;
+            session.arm()?;
+            Ok(session)
+        }
+
+        fn load(&self) -> Result<()> {
+            let loaded = unsafe { (self.api.load)(self.object) };
             if loaded != 0 {
                 bail!(
                     "loading socket events (kernel BTF, BPF and PERFMON permissions required): {}",
                     std::io::Error::from_raw_os_error(-loaded)
                 );
             }
-            session.stats_fd = unsafe { (session.api.find_map_fd)(object, c"stats".as_ptr()) };
-            let events_fd = unsafe { (session.api.find_map_fd)(object, c"events".as_ptr()) };
-            if session.stats_fd < 0 || events_fd < 0 {
+            Ok(())
+        }
+
+        fn map_fd(&self, name: &CStr) -> c_int {
+            unsafe { (self.api.find_map_fd)(self.object, name.as_ptr()) }
+        }
+
+        /// Find the loss counters and connect the callback to the event ring.
+        fn open_ring(&mut self) -> Result<()> {
+            self.stats_fd = self.map_fd(c"stats");
+            let events_fd = self.map_fd(c"events");
+            if self.stats_fd < 0 || events_fd < 0 {
                 bail!("embedded socket-event maps are unavailable");
             }
-            session.ring = session.api.pointer(
+            self.ring = self.api.pointer(
                 unsafe {
-                    (session.api.ring_new)(
+                    (self.api.ring_new)(
                         events_fd,
                         receive,
-                        (&mut *session.context as *mut CallbackState).cast(),
+                        (&mut *self.context as *mut CallbackState).cast(),
                         ptr::null(),
                     )
                 },
                 "opening socket-event ring buffer",
             )?;
+            Ok(())
+        }
+
+        /// Every program of the object, exits before entries.
+        fn programs_in_attachment_order(&self) -> Result<Vec<Handle>> {
             let mut program = ptr::null_mut();
             let mut programs = Vec::new();
             let mut sections = Vec::new();
             loop {
-                program = unsafe { (session.api.next_program)(object, program) };
+                program = unsafe { (self.api.next_program)(self.object, program) };
                 if program.is_null() {
                     break;
                 }
-                let section = unsafe { (session.api.section_name)(program) };
+                let section = unsafe { (self.api.section_name)(program) };
                 if section.is_null() {
                     bail!("socket-event program has no section name");
                 }
@@ -457,31 +485,43 @@ mod enabled {
                 // Program section strings live until the object is closed.
                 sections.push(unsafe { CStr::from_ptr(section) });
             }
+            Ok(attachment_order(&sections)?
+                .into_iter()
+                .map(|index| programs[index])
+                .collect())
+        }
+
+        fn attach(&mut self, programs: &[Handle]) -> Result<()> {
             // An entry observed before its exit probe is attached leaves a
             // permanent pending call. Subsequent calls then appear nested and
             // repeatedly invalidate ownership. Attach every exit first; reverse
             // link destruction likewise removes all entries before their exits.
-            for index in attachment_order(&sections)? {
-                let link = session.api.pointer(
-                    unsafe { (session.api.attach)(programs[index]) },
+            for &program in programs {
+                let link = self.api.pointer(
+                    unsafe { (self.api.attach)(program) },
                     "attaching socket-event program",
                 )?;
-                session.links.push(link);
+                self.links.push(link);
             }
-            if session.links.is_empty() {
+            if self.links.is_empty() {
                 bail!("embedded socket-event object has no programs");
             }
+            Ok(())
+        }
+
+        /// Enable paired observations only after every probe is attached.
+        fn arm(&self) -> Result<()> {
             // Attaching another probe can replace a function's trampoline.
             // Keep paired observations disabled throughout every attachment,
             // even though exit-first ordering also minimizes the attach gap.
-            let armed_fd = unsafe { (session.api.find_map_fd)(object, c"armed".as_ptr()) };
+            let armed_fd = self.map_fd(c"armed");
             if armed_fd < 0 {
                 bail!("embedded socket-event activation map is unavailable");
             }
             let key = 0_u32;
             let armed = 1_u32;
             let result = unsafe {
-                (session.api.map_update)(
+                (self.api.map_update)(
                     armed_fd,
                     (&key as *const u32).cast(),
                     (&armed as *const u32).cast(),
@@ -492,7 +532,7 @@ mod enabled {
                 return Err(std::io::Error::last_os_error())
                     .context("activating socket-event observations");
             }
-            Ok(session)
+            Ok(())
         }
 
         fn stats(&self) -> Result<Statistics> {
@@ -728,6 +768,26 @@ mod enabled {
             assert_eq!(published.packets.len(), 1);
             assert_eq!(published.lost, 2);
             assert_eq!(published.losses.0[5], 1);
+        }
+
+        #[test]
+        fn lifecycle_events_take_the_last_shared_slots_before_packets() {
+            let shared = Mutex::new(Batch {
+                packets: vec![PacketEvent::default(); MAX_EVENTS - 2],
+                ..Batch::default()
+            });
+            let mut staged = Batch {
+                events: vec![Event::default(); 3],
+                packets: vec![PacketEvent::default(); 2],
+                ..Batch::default()
+            };
+            assert!(publish(&mut staged, &shared, Losses::default(), None, None));
+            let published = shared.lock().unwrap();
+            assert_eq!(published.events.len(), 2);
+            assert_eq!(published.packets.len(), MAX_EVENTS - 2);
+            assert_eq!(published.lost, 3);
+            assert_eq!(published.losses.0[5], 3);
+            assert!(staged.events.is_empty() && staged.packets.is_empty());
         }
 
         #[test]

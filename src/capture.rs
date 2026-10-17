@@ -454,6 +454,136 @@ impl Batch {
     }
 }
 
+/// Packets read in one bounded burst, before fragment matching.
+struct Burst {
+    packets: Vec<(Packet, libc::timeval)>,
+    unsupported: u64,
+    truncated: u64,
+    failed: Option<String>,
+}
+
+/// Reads up to 2048 packets without blocking on an empty queue.
+fn read_burst(session: &Session) -> Burst {
+    let mut burst = Burst {
+        packets: Vec::with_capacity(256),
+        unsupported: 0,
+        truncated: 0,
+        failed: None,
+    };
+    for _ in 0..2048 {
+        let mut header = std::ptr::null();
+        let mut data = std::ptr::null();
+        let result = unsafe { (session.api.next)(session.handle, &mut header, &mut data) };
+        if result == 0 {
+            break;
+        }
+        if result < 0 {
+            burst.failed = Some(session.api.message(session.handle));
+            break;
+        }
+        if header.is_null() || data.is_null() {
+            burst.truncated += 1;
+            continue;
+        }
+        let header = unsafe { &*header };
+        let captured = unsafe {
+            std::slice::from_raw_parts(data, (header.caplen as usize).min(SNAPLEN as usize))
+        };
+        match packet::parse(captured, header.len, session.datalink) {
+            Ok(packet) => burst.packets.push((packet, header.timestamp)),
+            Err(packet::ParseError::Unsupported) => burst.unsupported += 1,
+            Err(_) => burst.truncated += 1,
+        }
+    }
+    burst
+}
+
+/// libpcap drop counters, read at most once per second.
+struct DropCounter {
+    read_at: Instant,
+    previous: PcapStats,
+}
+
+impl DropCounter {
+    fn new() -> Self {
+        Self {
+            read_at: Instant::now(),
+            previous: PcapStats::default(),
+        }
+    }
+
+    /// Packets dropped since the previous successful read, if one is due.
+    fn poll(&mut self, session: &Session) -> Option<u64> {
+        if self.read_at.elapsed() < Duration::from_secs(1) {
+            return None;
+        }
+        let mut stats = PcapStats::default();
+        let dropped =
+            (unsafe { (session.api.stats)(session.handle, &mut stats) } == 0).then(|| {
+                let dropped = dropped_since(&self.previous, &stats);
+                self.previous = stats;
+                dropped
+            });
+        self.read_at = Instant::now();
+        dropped
+    }
+}
+
+/// The capture worker loop: reads bursts into the shared bounded batch until
+/// stopped or libpcap fails. The thread no longer holds capture privileges.
+fn pump(
+    session: &Session,
+    mut clock: TimestampClock,
+    buffer: &Mutex<Batch>,
+    stop: &AtomicBool,
+    wake: &Wake,
+) {
+    let mut drops = DropCounter::new();
+    let mut fragments = Fragments::default();
+    let mut fragments_expired_at = Instant::now();
+    while !stop.load(Ordering::Relaxed) {
+        clock.refresh();
+        let mut burst = read_burst(session);
+        clock.refresh();
+        let idle = burst.packets.is_empty() && burst.unsupported == 0 && burst.truncated == 0;
+        let now = Instant::now();
+        for (packet, _) in &mut burst.packets {
+            fragments.apply(packet, now);
+        }
+        if now.saturating_duration_since(fragments_expired_at) >= FRAGMENT_LIFETIME {
+            fragments.expire(now);
+            fragments_expired_at = now;
+        }
+        if let Ok(mut buffer) = buffer.lock() {
+            let previous_size = buffer.flows.len() + buffer.timed_flows.len();
+            for (packet, timestamp) in burst.packets {
+                buffer.push(packet, clock.convert(&timestamp));
+            }
+            buffer.unsupported = buffer.unsupported.saturating_add(burst.unsupported);
+            buffer.truncated = buffer.truncated.saturating_add(burst.truncated);
+            if let Some(dropped) = drops.poll(session) {
+                buffer.dropped = buffer.dropped.saturating_add(dropped);
+            }
+            if let Some(error) = burst.failed.as_ref() {
+                buffer.error = Some(error.clone());
+            }
+            // Wake the owner scanner before the bounded queue fills.
+            // Low traffic retains the normal 250–500 ms cadence.
+            if previous_size < MAX_FLOWS / 4
+                && buffer.flows.len() + buffer.timed_flows.len() >= MAX_FLOWS / 4
+            {
+                wake.notify();
+            }
+        }
+        if burst.failed.is_some() {
+            return;
+        }
+        if idle {
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
 pub(super) struct Capture {
     buffer: Arc<Mutex<Batch>>,
     stop: Arc<AtomicBool>,
@@ -473,7 +603,7 @@ impl Capture {
         let worker = thread::Builder::new()
             .name("nwtop-capture".to_string())
             .spawn(move || {
-                let mut clock = TimestampClock::new();
+                let clock = TimestampClock::new();
                 let session = match Session::open() {
                     Ok(session) => session,
                     Err(error) => {
@@ -491,90 +621,7 @@ impl Capture {
                 if sender.send(Ok(session.datalink == 276)).is_err() {
                     return;
                 }
-                let mut stats_at = Instant::now();
-                let mut previous_stats = PcapStats::default();
-                let mut fragments = Fragments::default();
-                let mut fragments_expired_at = Instant::now();
-                while !thread_stop.load(Ordering::Relaxed) {
-                    clock.refresh();
-                    let mut packets = Vec::with_capacity(256);
-                    let mut unsupported = 0_u64;
-                    let mut truncated = 0_u64;
-                    let mut failed = None;
-                    for _ in 0..2048 {
-                        let mut header = std::ptr::null();
-                        let mut data = std::ptr::null();
-                        let result =
-                            unsafe { (session.api.next)(session.handle, &mut header, &mut data) };
-                        if result == 0 {
-                            break;
-                        }
-                        if result < 0 {
-                            failed = Some(session.api.message(session.handle));
-                            break;
-                        }
-                        if header.is_null() || data.is_null() {
-                            truncated += 1;
-                            continue;
-                        }
-                        let header = unsafe { &*header };
-                        let captured = unsafe {
-                            std::slice::from_raw_parts(
-                                data,
-                                (header.caplen as usize).min(SNAPLEN as usize),
-                            )
-                        };
-                        match packet::parse(captured, header.len, session.datalink) {
-                            Ok(packet) => packets.push((packet, header.timestamp)),
-                            Err(packet::ParseError::Unsupported) => unsupported += 1,
-                            Err(_) => truncated += 1,
-                        }
-                    }
-                    clock.refresh();
-                    let idle = packets.is_empty() && unsupported == 0 && truncated == 0;
-                    let now = Instant::now();
-                    for (packet, _) in &mut packets {
-                        fragments.apply(packet, now);
-                    }
-                    if now.saturating_duration_since(fragments_expired_at) >= FRAGMENT_LIFETIME {
-                        fragments.expire(now);
-                        fragments_expired_at = now;
-                    }
-                    if let Ok(mut buffer) = thread_buffer.lock() {
-                        let previous_size = buffer.flows.len() + buffer.timed_flows.len();
-                        for (packet, timestamp) in packets {
-                            buffer.push(packet, clock.convert(&timestamp));
-                        }
-                        buffer.unsupported = buffer.unsupported.saturating_add(unsupported);
-                        buffer.truncated = buffer.truncated.saturating_add(truncated);
-                        if stats_at.elapsed() >= Duration::from_secs(1) {
-                            let mut stats = PcapStats::default();
-                            if unsafe { (session.api.stats)(session.handle, &mut stats) } == 0 {
-                                buffer.dropped = buffer
-                                    .dropped
-                                    .saturating_add(dropped_since(&previous_stats, &stats));
-                                previous_stats = stats;
-                            }
-                            stats_at = Instant::now();
-                        }
-                        if let Some(error) = failed.as_ref() {
-                            buffer.error = Some(error.clone());
-                        }
-                        // Wake the owner scanner before the bounded queue fills.
-                        // Low traffic retains the normal 250–500 ms cadence.
-                        if previous_size < MAX_FLOWS / 4
-                            && buffer.flows.len() + buffer.timed_flows.len() >= MAX_FLOWS / 4
-                        {
-                            thread_wake.notify();
-                        }
-                    }
-                    if failed.is_some() {
-                        return;
-                    }
-                    if idle {
-                        thread::sleep(Duration::from_millis(10));
-                    }
-                }
+                pump(&session, clock, &thread_buffer, &thread_stop, &thread_wake);
             })
             .context("starting packet capture worker")?;
         match receiver.recv_timeout(Duration::from_secs(3)) {

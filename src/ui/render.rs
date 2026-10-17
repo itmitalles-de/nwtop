@@ -41,6 +41,19 @@ fn number_cell(text: String) -> Cell<'static> {
     Cell::from(Line::from(text).alignment(Alignment::Right))
 }
 
+/// A rate without its "/s" suffix, for columns and axes that already say /s.
+fn short_rate(value: f64, bits: bool) -> String {
+    format_rate(value, bits).trim_end_matches("/s").to_string()
+}
+
+/// Highest RX or TX rate in the history, but at least 1 KiB/s.
+fn history_peak(app: &App) -> f64 {
+    app.history
+        .iter()
+        .flat_map(|sample| [sample.rx, sample.tx])
+        .fold(1024.0f64, f64::max)
+}
+
 pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     let area = frame.area();
     if area.width < 36 || area.height < 16 {
@@ -163,11 +176,7 @@ fn draw_device(frame: &mut Frame<'_>, app: &App, area: Rect) {
         )
         .into()
     };
-    let peak = app
-        .history
-        .iter()
-        .flat_map(|sample| [sample.rx, sample.tx])
-        .fold(1024.0f64, f64::max);
+    let peak = history_peak(app);
     let line_speed = device
         .and_then(|iface| iface.speed_mbps)
         .filter(|speed| *speed > 0)
@@ -318,186 +327,237 @@ pub(super) fn status_line(app: &App) -> Option<(String, Color)> {
     (!message.is_empty()).then(|| (message.to_string(), TX))
 }
 
+/// Tables at least this wide show every field.
+const WIDE_TABLE: u16 = 94;
+/// Narrower tables drop secondary columns; below this they also shrink rates.
+const MEDIUM_TABLE: u16 = 52;
+
 fn draw_table(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     app.visible_rows = usize::from(area.height.saturating_sub(1));
-    let wide = area.width >= 94;
-    let medium = area.width >= 52;
-    let captured = app.snapshot.capture.active || app.demo;
-    let lang = app.lang();
-    let user = lang.pick("USER", "BENUTZER");
-    let command = lang.pick("COMMAND", "BEFEHL");
-    let remote = lang.pick("REMOTE", "FERN");
-    let receive_color = plot_color(app.settings.rx_color);
-    let send_color = plot_color(app.settings.tx_color);
-    let rate = |value| {
-        if captured {
+    let cells = TableCells::new(app);
+    let columns = if app.settings.connections {
+        connection_columns(app, &cells, area.width)
+    } else {
+        process_columns(app, &cells, area.width)
+    };
+    let count = columns.rows.len();
+    let table = Table::new(columns.rows, columns.widths)
+        .header(table_header(columns.headers))
+        .column_spacing(1)
+        .row_highlight_style(inverse(KEY));
+    frame.render_stateful_widget(table, area, &mut app.table);
+    if count == 0 && area.height > 1 {
+        draw_empty_table_notice(frame, app, area);
+    }
+}
+
+/// Header labels, column widths and body rows of one table layout.
+struct TableColumns {
+    headers: Vec<&'static str>,
+    widths: Vec<Constraint>,
+    rows: Vec<Row<'static>>,
+}
+
+/// Rate and byte cells shared by the process and connection tables.
+struct TableCells {
+    /// Without capture (outside demo mode) rates are unknown, not zero.
+    captured: bool,
+    bits: bool,
+    receive: Style,
+    send: Style,
+}
+
+impl TableCells {
+    fn new(app: &App) -> Self {
+        Self {
+            captured: app.snapshot.capture.active || app.demo,
+            bits: app.settings.bits,
+            receive: Style::default().fg(plot_color(app.settings.rx_color)),
+            send: Style::default().fg(plot_color(app.settings.tx_color)),
+        }
+    }
+
+    fn rate(&self, value: f64) -> String {
+        if self.captured {
             // The column header already carries /s; retain the whole unit at 40 columns.
-            format_rate(value, app.settings.bits)
-                .trim_end_matches("/s")
-                .to_string()
+            short_rate(value, self.bits)
         } else {
             "-".to_string()
         }
-    };
-    let total = |value| {
-        if captured {
+    }
+
+    fn receive(&self, value: f64) -> Cell<'static> {
+        number_cell(self.rate(value)).style(self.receive)
+    }
+
+    fn send(&self, value: f64) -> Cell<'static> {
+        number_cell(self.rate(value)).style(self.send)
+    }
+
+    fn total(&self, value: u64) -> Cell<'static> {
+        number_cell(if self.captured {
             format_bytes(value as f64)
         } else {
             "-".to_string()
-        }
-    };
-    let (headers, widths, rows): (Vec<&str>, Vec<Constraint>, Vec<Row<'_>>) = if app
-        .settings
-        .connections
-    {
-        let records = app.connection_rows();
-        if wide {
-            (
-                vec![
-                    "PID",
-                    "PROTO",
-                    "RX/s",
-                    "TX/s",
-                    lang.pick("LOCAL", "LOKAL"),
-                    remote,
-                    command,
-                ],
-                vec![
-                    Constraint::Length(7),
-                    Constraint::Length(5),
-                    Constraint::Length(12),
-                    Constraint::Length(12),
-                    Constraint::Percentage(25),
-                    Constraint::Percentage(25),
-                    Constraint::Min(8),
-                ],
-                records
-                    .into_iter()
-                    .map(|row| {
-                        Row::new(vec![
-                            number_cell(pid(row.pid)),
-                            Cell::from(row.protocol.clone()),
-                            number_cell(rate(row.rx_rate))
-                                .style(Style::default().fg(receive_color)),
-                            number_cell(rate(row.tx_rate)).style(Style::default().fg(send_color)),
-                            Cell::from(row.local.clone()),
-                            Cell::from(row.remote.clone()),
-                            Cell::from(row.process.clone()),
-                        ])
-                    })
-                    .collect(),
-            )
-        } else {
-            (
-                vec!["PID", "RX/s", "TX/s", remote],
-                vec![
-                    Constraint::Length(7),
-                    Constraint::Length(if medium { 12 } else { 10 }),
-                    Constraint::Length(if medium { 12 } else { 10 }),
-                    Constraint::Min(6),
-                ],
-                records
-                    .into_iter()
-                    .map(|row| {
-                        Row::new(vec![
-                            number_cell(pid(row.pid)),
-                            number_cell(rate(row.rx_rate))
-                                .style(Style::default().fg(receive_color)),
-                            number_cell(rate(row.tx_rate)).style(Style::default().fg(send_color)),
-                            Cell::from(row.remote.clone()),
-                        ])
-                    })
-                    .collect(),
-            )
+        })
+    }
+}
+
+fn connection_columns(app: &App, cells: &TableCells, width: u16) -> TableColumns {
+    let lang = app.lang();
+    let remote = lang.pick("REMOTE", "FERN");
+    let records = app.connection_rows();
+    if width >= WIDE_TABLE {
+        TableColumns {
+            headers: vec![
+                "PID",
+                "PROTO",
+                "RX/s",
+                "TX/s",
+                lang.pick("LOCAL", "LOKAL"),
+                remote,
+                lang.pick("COMMAND", "BEFEHL"),
+            ],
+            widths: vec![
+                Constraint::Length(7),
+                Constraint::Length(5),
+                Constraint::Length(12),
+                Constraint::Length(12),
+                Constraint::Percentage(25),
+                Constraint::Percentage(25),
+                Constraint::Min(8),
+            ],
+            rows: records
+                .into_iter()
+                .map(|row| {
+                    Row::new(vec![
+                        number_cell(pid(row.pid)),
+                        Cell::from(row.protocol.clone()),
+                        cells.receive(row.rx_rate),
+                        cells.send(row.tx_rate),
+                        Cell::from(row.local.clone()),
+                        Cell::from(row.remote.clone()),
+                        Cell::from(row.process.clone()),
+                    ])
+                })
+                .collect(),
         }
     } else {
-        let records = app.process_rows();
-        if wide {
-            (
-                vec![
-                    "PID",
-                    user,
-                    "RX/s",
-                    "TX/s",
-                    lang.pick("TOTAL", "GESAMT"),
-                    lang.pick("CONN", "VERB"),
-                    command,
-                ],
-                vec![
-                    Constraint::Length(7),
-                    Constraint::Length(10),
-                    Constraint::Length(12),
-                    Constraint::Length(12),
-                    Constraint::Length(12),
-                    Constraint::Length(5),
-                    Constraint::Min(8),
-                ],
-                records
-                    .into_iter()
-                    .map(|row| {
-                        Row::new(vec![
-                            number_cell(pid(row.pid)),
-                            Cell::from(row.user.clone()),
-                            number_cell(rate(row.rx_rate))
-                                .style(Style::default().fg(receive_color)),
-                            number_cell(rate(row.tx_rate)).style(Style::default().fg(send_color)),
-                            number_cell(total(row.rx_bytes.saturating_add(row.tx_bytes))),
-                            number_cell(row.connections.to_string()),
-                            Cell::from(row.name.clone()),
-                        ])
-                    })
-                    .collect(),
-            )
-        } else if medium {
-            (
-                vec!["PID", user, "RX/s", "TX/s", command],
-                vec![
-                    Constraint::Length(7),
-                    Constraint::Length(8),
-                    Constraint::Length(if area.width >= 64 { 12 } else { 10 }),
-                    Constraint::Length(if area.width >= 64 { 12 } else { 10 }),
-                    Constraint::Min(6),
-                ],
-                records
-                    .into_iter()
-                    .map(|row| {
-                        Row::new(vec![
-                            number_cell(pid(row.pid)),
-                            Cell::from(row.user.clone()),
-                            number_cell(rate(row.rx_rate))
-                                .style(Style::default().fg(receive_color)),
-                            number_cell(rate(row.tx_rate)).style(Style::default().fg(send_color)),
-                            Cell::from(row.name.clone()),
-                        ])
-                    })
-                    .collect(),
-            )
-        } else {
-            (
-                vec!["PID", "RX/s", "TX/s", command],
-                vec![
-                    Constraint::Length(7),
-                    Constraint::Length(10),
-                    Constraint::Length(10),
-                    Constraint::Min(5),
-                ],
-                records
-                    .into_iter()
-                    .map(|row| {
-                        Row::new(vec![
-                            number_cell(pid(row.pid)),
-                            number_cell(rate(row.rx_rate))
-                                .style(Style::default().fg(receive_color)),
-                            number_cell(rate(row.tx_rate)).style(Style::default().fg(send_color)),
-                            Cell::from(row.name.clone()),
-                        ])
-                    })
-                    .collect(),
-            )
+        let rate_width = if width >= MEDIUM_TABLE { 12 } else { 10 };
+        TableColumns {
+            headers: vec!["PID", "RX/s", "TX/s", remote],
+            widths: vec![
+                Constraint::Length(7),
+                Constraint::Length(rate_width),
+                Constraint::Length(rate_width),
+                Constraint::Min(6),
+            ],
+            rows: records
+                .into_iter()
+                .map(|row| {
+                    Row::new(vec![
+                        number_cell(pid(row.pid)),
+                        cells.receive(row.rx_rate),
+                        cells.send(row.tx_rate),
+                        Cell::from(row.remote.clone()),
+                    ])
+                })
+                .collect(),
         }
-    };
-    let count = rows.len();
-    let header = Row::new(headers.into_iter().map(|header| {
+    }
+}
+
+fn process_columns(app: &App, cells: &TableCells, width: u16) -> TableColumns {
+    let lang = app.lang();
+    let user = lang.pick("USER", "BENUTZER");
+    let command = lang.pick("COMMAND", "BEFEHL");
+    let records = app.process_rows();
+    if width >= WIDE_TABLE {
+        TableColumns {
+            headers: vec![
+                "PID",
+                user,
+                "RX/s",
+                "TX/s",
+                lang.pick("TOTAL", "GESAMT"),
+                lang.pick("CONN", "VERB"),
+                command,
+            ],
+            widths: vec![
+                Constraint::Length(7),
+                Constraint::Length(10),
+                Constraint::Length(12),
+                Constraint::Length(12),
+                Constraint::Length(12),
+                Constraint::Length(5),
+                Constraint::Min(8),
+            ],
+            rows: records
+                .into_iter()
+                .map(|row| {
+                    Row::new(vec![
+                        number_cell(pid(row.pid)),
+                        Cell::from(row.user.clone()),
+                        cells.receive(row.rx_rate),
+                        cells.send(row.tx_rate),
+                        cells.total(row.rx_bytes.saturating_add(row.tx_bytes)),
+                        number_cell(row.connections.to_string()),
+                        Cell::from(row.name.clone()),
+                    ])
+                })
+                .collect(),
+        }
+    } else if width >= MEDIUM_TABLE {
+        let rate_width = if width >= 64 { 12 } else { 10 };
+        TableColumns {
+            headers: vec!["PID", user, "RX/s", "TX/s", command],
+            widths: vec![
+                Constraint::Length(7),
+                Constraint::Length(8),
+                Constraint::Length(rate_width),
+                Constraint::Length(rate_width),
+                Constraint::Min(6),
+            ],
+            rows: records
+                .into_iter()
+                .map(|row| {
+                    Row::new(vec![
+                        number_cell(pid(row.pid)),
+                        Cell::from(row.user.clone()),
+                        cells.receive(row.rx_rate),
+                        cells.send(row.tx_rate),
+                        Cell::from(row.name.clone()),
+                    ])
+                })
+                .collect(),
+        }
+    } else {
+        TableColumns {
+            headers: vec!["PID", "RX/s", "TX/s", command],
+            widths: vec![
+                Constraint::Length(7),
+                Constraint::Length(10),
+                Constraint::Length(10),
+                Constraint::Min(5),
+            ],
+            rows: records
+                .into_iter()
+                .map(|row| {
+                    Row::new(vec![
+                        number_cell(pid(row.pid)),
+                        cells.receive(row.rx_rate),
+                        cells.send(row.tx_rate),
+                        Cell::from(row.name.clone()),
+                    ])
+                })
+                .collect(),
+        }
+    }
+}
+
+/// Numeric column headers are right-aligned over their values.
+fn table_header(headers: Vec<&'static str>) -> Row<'static> {
+    Row::new(headers.into_iter().map(|header| {
         if matches!(
             header,
             "PID" | "RX/s" | "TX/s" | "TOTAL" | "CONN" | "GESAMT" | "VERB"
@@ -507,34 +567,31 @@ fn draw_table(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             Cell::from(header)
         }
     }))
-    .style(inverse(Color::Green));
-    let table = Table::new(rows, widths)
-        .header(header)
-        .column_spacing(1)
-        .row_highlight_style(inverse(KEY));
-    frame.render_stateful_widget(table, area, &mut app.table);
-    if count == 0 && area.height > 1 {
-        let message = if app.filter.is_empty() {
-            lang.pick(
-                "Waiting for network activity...",
-                "Warte auf Netzwerkaktivität...",
-            )
-        } else {
-            lang.pick(
-                "No matching processes or connections.",
-                "Keine passenden Prozesse oder Verbindungen.",
-            )
-        };
-        frame.render_widget(
-            Paragraph::new(message).style(Style::default().fg(DIM)),
-            Rect {
-                x: area.x,
-                y: area.y + 1,
-                width: area.width,
-                height: 1,
-            },
-        );
-    }
+    .style(inverse(Color::Green))
+}
+
+fn draw_empty_table_notice(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let lang = app.lang();
+    let message = if app.filter.is_empty() {
+        lang.pick(
+            "Waiting for network activity...",
+            "Warte auf Netzwerkaktivität...",
+        )
+    } else {
+        lang.pick(
+            "No matching processes or connections.",
+            "Keine passenden Prozesse oder Verbindungen.",
+        )
+    };
+    frame.render_widget(
+        Paragraph::new(message).style(Style::default().fg(DIM)),
+        Rect {
+            x: area.x,
+            y: area.y + 1,
+            width: area.width,
+            height: 1,
+        },
+    );
 }
 
 fn draw_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
