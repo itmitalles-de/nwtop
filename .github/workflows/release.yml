@@ -1,0 +1,77 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          # Ubuntu 22.04 keeps the glibc requirement at 2.35.
+          - arch: x86_64
+            runner: ubuntu-22.04
+          - arch: aarch64
+            runner: ubuntu-22.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check tag against Cargo version
+        run: |
+          version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
+          test "v$version" = "$GITHUB_REF_NAME"
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal
+      - name: Build standard release
+        run: cargo +stable build --release --locked
+      - name: Smoke test
+        run: |
+          target/release/nwtop --version
+          target/release/nwtop --no-capture --once
+      - name: Package
+        run: |
+          name="nwtop-$VERSION-${{ matrix.arch }}-linux"
+          mkdir -p "$name/bin" "$name/scripts"
+          install -m 755 target/release/nwtop target/release/nwtop-collector "$name/bin/"
+          install -m 755 scripts/install.sh scripts/setup-capture.sh "$name/scripts/"
+          install -m 644 README.md LICENSE "$name/"
+          tar --owner=0 --group=0 --numeric-owner -czf "$name.tar.gz" "$name"
+          echo "ARCHIVE=$name.tar.gz" >> "$GITHUB_ENV"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ env.ARCHIVE }}
+          path: ${{ env.ARCHIVE }}
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd dist
+          sha256sum -- *.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag \
+            --title "nwtop $GITHUB_REF_NAME" --generate-notes -- *.tar.gz SHA256SUMS

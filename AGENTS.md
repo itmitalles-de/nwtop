@@ -1,6 +1,7 @@
 # nwtop
 
-Follow `/home/tim/AGENTS.md` when working on the owner's machine.
+Follow the owner's global agent instructions (`~/.claude/CLAUDE.md` for Claude Code,
+`~/.codex/AGENTS.md` for Codex) when working on the owner's machine.
 
 This is a Linux terminal monitor in Rust, visually based on nvtop: compact device
 information, a green RX / yellow TX history graph, a process or connection table,
@@ -14,3 +15,6 @@ demo values in live mode. Avoid packet payload retention and DNS lookups.
 Run `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, and
 `cargo test`. Test real TCP and UDP traffic in an isolated container when capture
 code changes. Keep screenshots, recordings and local review data out of Git.
+
+The optional eBPF backend (`--features ebpf`) is experimental and takes bug fixes
+only; do not extend it without an owner decision.

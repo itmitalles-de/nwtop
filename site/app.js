@@ -1,6 +1,6 @@
 const root = document.documentElement;
 // Keep existing visitor preferences across the product rename on the same origin.
-const STORAGE = { theme: 'nettop-theme', lang: 'nettop-lang' };
+const STORAGE = { theme: 'nwtop-theme', lang: 'nwtop-lang' };
 
 function writeStored(key, value) {
   try {

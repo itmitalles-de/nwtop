@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Build as the regular user; install only a fixed, reviewed helper as root.
-# The administrator who authenticates trusts this checkout: the root phase
-# runs this user-writable script and installs the binary the user built.
+# The administrator who authenticates trusts this checkout or release archive:
+# the root phase runs this user-writable script and installs the user's binary.
 set -euo pipefail
 
 destination=/usr/local/libexec/nwtop-collector
@@ -173,7 +173,15 @@ done
 # Fail before building and authenticating; the root phase checks again.
 check_group "$(id -u)" "$(id -g)" "$allow_shared" "$reassign"
 repo_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+# A release archive ships bin/nwtop-collector instead of the source tree.
+prebuilt=0
+if [[ -f "$repo_dir/bin/nwtop-collector" && ! -e "$repo_dir/Cargo.toml" ]]; then
+    prebuilt=1
+fi
 build_options=()
+if (( extended && prebuilt )); then
+    fail 'Release archives contain the standard build; build from source for extended attribution.'
+fi
 if (( extended )); then
     bpf_clang="${NWTOP_BPF_CLANG:-clang}"
     if ! command -v "$bpf_clang" >/dev/null 2>&1 ||
@@ -191,16 +199,20 @@ HEADERS
     fi
     build_options=(--features ebpf)
 fi
-cargo build --release --locked "${build_options[@]}" --bin nwtop-collector --manifest-path "$repo_dir/Cargo.toml" --target-dir "$repo_dir/target"
-binary="$repo_dir/target/release/nwtop-collector"
+if (( prebuilt )); then
+    binary="$repo_dir/bin/nwtop-collector"
+else
+    cargo build --release --locked "${build_options[@]}" --bin nwtop-collector --manifest-path "$repo_dir/Cargo.toml" --target-dir "$repo_dir/target"
+    binary="$repo_dir/target/release/nwtop-collector"
+fi
 read -r digest _ < <(sha256sum -- "$binary")
 printf 'One-time setup: install %s with capture and /proc read capabilities.\n' "$destination"
 if (( extended )); then
-    printf 'Extended attribution also grants BPF, PERFMON and NET_ADMIN capabilities for socket events and conntrack.\n'
+    printf 'Extended attribution (experimental) also grants BPF, PERFMON and NET_ADMIN capabilities for socket events and conntrack.\n'
     printf 'To remove those extra capabilities, rerun both installation scripts without --extended-attribution.\n'
 fi
 printf 'Every member of your primary group (%s) can use it. The terminal UI stays unprivileged.\n' "$(id -gn)"
-printf 'Authenticating trusts this checkout: the administrator runs this script and installs your build.\n'
+printf 'Authenticating trusts this checkout or release archive: the administrator runs this script and installs your binary.\n'
 if command -v pkexec >/dev/null 2>&1; then
     exec pkexec /usr/bin/bash "$repo_dir/scripts/setup-capture.sh" --install "$binary" "$(id -u)" "$(id -g)" "$digest" "$allow_shared" "$reassign" "$extended"
 elif command -v sudo >/dev/null 2>&1; then

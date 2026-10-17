@@ -1,6 +1,6 @@
 # Public site assets
 
-`nettop-demo.png`, `nettop-setup.png`, `nettop-sort.png` and `nettop-demo.mp4`
+`nwtop-demo.png`, `nwtop-setup.png`, `nwtop-sort.png` and `nwtop-demo.mp4`
 show the actual nwtop terminal UI in explicit `--demo` mode. Traffic, addresses
 and process rows are synthetic. The asset filenames retain the former project
 name; the terminal views contain no old product branding. The recording demonstrates monitoring, F2 Setup
