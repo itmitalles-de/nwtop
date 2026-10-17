@@ -6,6 +6,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use libloading::Library;
 use std::collections::HashMap;
 use std::ffi::{CStr, CString};
+use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
@@ -471,9 +472,10 @@ fn read_burst(session: &Session) -> Burst {
         failed: None,
     };
     for _ in 0..2048 {
-        let mut header = std::ptr::null();
-        let mut data = std::ptr::null();
-        let result = unsafe { (session.api.next)(session.handle, &mut header, &mut data) };
+        let mut header = MaybeUninit::<*const PcapHeader>::uninit();
+        let mut data = MaybeUninit::<*const u8>::uninit();
+        let result =
+            unsafe { (session.api.next)(session.handle, header.as_mut_ptr(), data.as_mut_ptr()) };
         if result == 0 {
             break;
         }
@@ -481,6 +483,8 @@ fn read_burst(session: &Session) -> Burst {
             burst.failed = Some(session.api.message(session.handle));
             break;
         }
+        // pcap_next_ex returns 1 only after storing both output pointers.
+        let (header, data) = unsafe { (header.assume_init(), data.assume_init()) };
         if header.is_null() || data.is_null() {
             burst.truncated += 1;
             continue;
