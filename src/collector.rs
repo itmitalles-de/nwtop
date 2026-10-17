@@ -4,12 +4,8 @@
 mod capture;
 #[path = "conntrack.rs"]
 mod conntrack;
-#[path = "event_owners.rs"]
-mod event_owners;
 #[path = "events.rs"]
 mod events;
-#[path = "extended.rs"]
-mod extended;
 #[path = "links.rs"]
 mod links;
 #[path = "packet.rs"]
@@ -17,18 +13,24 @@ mod packet;
 #[path = "sockets.rs"]
 mod sockets;
 
+mod endpoints;
+mod event_owners;
+mod extended;
 mod interfaces;
+mod rows;
+mod status;
 
+use endpoints::{LocalView, local_socket_endpoints, published_port_proxy, traffic_sides};
 pub use interfaces::default_interface;
 use interfaces::{TopologyCache, local_interfaces, read_interfaces};
 
 use crate::i18n::Lang;
-use crate::model::{CaptureNote, CaptureStatus, ConnectionRow, Interface, ProcessRow, Snapshot};
+use crate::model::{CaptureNote, Interface, Snapshot};
 use anyhow::{Context, Result};
 use packet::{Direction, Flow};
-use sockets::{Inventory, Owner, ProcessIdentity, Resolution, Socket, SocketKey, canonical_ip};
+use sockets::{Inventory, Owner, ProcessIdentity, Resolution, Socket, SocketKey};
 use std::collections::{HashMap, HashSet};
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, JoinHandle};
@@ -93,6 +95,15 @@ struct Bytes {
 }
 
 impl Bytes {
+    /// `bytes` received (`receive`) or sent.
+    fn one_way(receive: bool, bytes: u64) -> Self {
+        if receive {
+            Self { rx: bytes, tx: 0 }
+        } else {
+            Self { rx: 0, tx: bytes }
+        }
+    }
+
     fn add(&mut self, other: Self) {
         self.rx = self.rx.saturating_add(other.rx);
         self.tx = self.tx.saturating_add(other.tx);
@@ -149,6 +160,18 @@ struct IntervalStatus {
     attribution_overflow: u64,
     unsupported: u64,
     truncated: u64,
+}
+
+impl IntervalStatus {
+    fn add_batch(&mut self, batch: &capture::Batch) {
+        self.dropped = self.dropped.saturating_add(batch.dropped);
+        self.overflow = self.overflow.saturating_add(batch.overflow);
+        self.unsupported = self.unsupported.saturating_add(batch.unsupported);
+        self.truncated = self.truncated.saturating_add(batch.truncated);
+        self.timestamp_invalid = self
+            .timestamp_invalid
+            .saturating_add(batch.timestamp_invalid);
+    }
 }
 
 #[derive(Default)]
@@ -263,19 +286,7 @@ impl Collector {
             .then(|| extended::Extended::start(Arc::clone(&wake)));
         inventory.set_namespace_discovery(extended.as_ref().is_some_and(|e| e.available()));
         let interfaces = read_interfaces()?;
-        let previous_interfaces = interfaces
-            .iter()
-            .map(|interface| {
-                (
-                    interface.info.name.clone(),
-                    (
-                        interface.index,
-                        interface.info.rx_bytes,
-                        interface.info.tx_bytes,
-                    ),
-                )
-            })
-            .collect();
+        let previous_interfaces = interface_counters(&interfaces);
         let last_sample = Instant::now();
         let (capture, capture_note) = if capture_enabled {
             match capture::Capture::start(wake) {
@@ -314,13 +325,7 @@ impl Collector {
     /// `None` means all captured interfaces, including virtual links. The status
     /// warns about duplicate observations across host bridges and veth devices.
     pub fn sample(&mut self, interface: Option<&str>) -> Result<Snapshot> {
-        if std::mem::take(&mut self.start_worker) {
-            // Started once; on failure, attribution falls back to snapshots.
-            match Worker::start(Arc::clone(&self.shared)) {
-                Ok(worker) => self.worker = Some(worker),
-                Err(error) => lock(&self.shared).worker_error = Some(format!("{error:#}")),
-            }
-        }
+        self.start_worker_once();
         let mut interfaces = read_interfaces()?;
         // Hot unplug is an empty scope, never a silent switch to all devices.
         // The CLI validates an explicit initial selection itself.
@@ -340,119 +345,20 @@ impl Collector {
             .duration_since(self.last_sample)
             .as_secs_f64()
             .max(0.001);
-        for current in &mut interfaces {
-            if let Some(&(old_index, rx, tx)) = self.previous_interfaces.get(&current.info.name)
-                && old_index == current.index
-            {
-                current.info.rx_rate = counter_rate(current.info.rx_bytes, rx, interval);
-                current.info.tx_rate = counter_rate(current.info.tx_bytes, tx, interval);
-            }
-        }
-        self.previous_interfaces = interfaces
-            .iter()
-            .map(|current| {
-                (
-                    current.info.name.clone(),
-                    (current.index, current.info.rx_bytes, current.info.tx_bytes),
-                )
-            })
-            .collect();
+        set_interface_rates(&mut interfaces, &self.previous_interfaces, interval);
+        self.previous_interfaces = interface_counters(&interfaces);
         self.last_sample = now;
         state.prune(now, &interfaces);
         let deltas = std::mem::take(&mut state.deltas);
         let problems = std::mem::take(&mut state.status);
         let counter_limit = std::mem::take(&mut state.counters.limit_hit);
 
-        let mut status = CaptureStatus {
-            active: state.capture.is_some(),
-            notes: self.capture_note.iter().cloned().collect(),
-            ..CaptureStatus::default()
-        };
-        if let Some(capture) = &state.capture {
-            // Per-interval values: a past burst must not taint later snapshots.
-            status.dropped = problems.dropped.saturating_add(problems.overflow);
-            status.notes = vec![if interface.is_some() && !capture.interface_indexes {
-                status.active = false;
-                CaptureNote::NoInterfaceIndexes
-            } else if interface.is_none() {
-                CaptureNote::AllInterfaces
-            } else {
-                CaptureNote::Sampled
-            }];
-            if problems.dropped > 0 {
-                status.notes.push(CaptureNote::PcapMissed {
-                    packets: problems.dropped,
-                });
-            }
-            if problems.overflow > 0 {
-                status.notes.push(CaptureNote::CaptureQueueLimit {
-                    packets: problems.overflow,
-                });
-            }
-            if problems.attribution_overflow > 0 {
-                status.notes.push(CaptureNote::AttributionQueueLimit {
-                    packets: problems.attribution_overflow,
-                });
-            }
-            if problems.unsupported > 0 || problems.truncated > 0 {
-                status.notes.push(CaptureNote::Unreadable {
-                    unsupported: problems.unsupported,
-                    truncated: problems.truncated,
-                });
-            }
-            if let Some(error) = &state.worker_error {
-                status.notes.push(CaptureNote::AttributionAtRefresh {
-                    error: error.clone(),
-                });
-            }
-            if let Some(error) = &state.capture_error {
-                status.active = false;
-                status.notes = vec![CaptureNote::Stopped {
-                    error: error.clone(),
-                }];
-            }
-        }
-        if let Some(extended) = &state.extended {
-            let socket_packets = interface.is_none() && extended.packet_capture_active();
-            if socket_packets {
-                for note in &mut status.notes {
-                    if *note == CaptureNote::AllInterfaces {
-                        *note = CaptureNote::AllSocketPackets;
-                    }
-                }
-            }
-            if interface.is_none() && extended.packet_capture_failed() {
-                status.active = false;
-            }
-            if extended.available() {
-                status.notes.retain(|note| *note != CaptureNote::Sampled);
-                status.notes.push(CaptureNote::Extended);
-            }
-            if extended.available() && !socket_packets && problems.timestamp_invalid > 0 {
-                status.notes.push(CaptureNote::ExtendedIssue {
-                    detail: format!(
-                        "{} packet timestamps unavailable; uncertain event owners withheld",
-                        problems.timestamp_invalid
-                    ),
-                });
-            }
-            for detail in &extended.issues {
-                status.notes.push(CaptureNote::ExtendedIssue {
-                    detail: detail.clone(),
-                });
-            }
-            if extended.unconfirmed.replace(false) && !socket_packets {
-                status.notes.push(CaptureNote::ExtendedIssue {
-                    detail: "no confirmed conntrack entry for some flows; only positive socket events can attribute them".into(),
-                });
-            }
-        }
-        if state.inventory.restricted {
-            status.notes.push(CaptureNote::OwnersInaccessible);
-        }
-        if state.inventory.limited || counter_limit {
-            status.notes.push(CaptureNote::CounterLimit);
-        }
+        let mut status = state.capture_status(
+            &problems,
+            interface,
+            self.capture_note.as_ref(),
+            counter_limit,
+        );
         if missing_interface {
             status.active = false;
             status.notes = vec![CaptureNote::InterfaceMissing {
@@ -473,6 +379,51 @@ impl Collector {
             connections,
             capture: status,
         })
+    }
+
+    /// Started once, on the first snapshot; on failure, attribution falls
+    /// back to snapshots.
+    fn start_worker_once(&mut self) {
+        if std::mem::take(&mut self.start_worker) {
+            match Worker::start(Arc::clone(&self.shared)) {
+                Ok(worker) => self.worker = Some(worker),
+                Err(error) => lock(&self.shared).worker_error = Some(format!("{error:#}")),
+            }
+        }
+    }
+}
+
+/// Kernel byte counters by interface name, with the ifindex that owns them.
+fn interface_counters(interfaces: &[KernelInterface]) -> HashMap<String, (u32, u64, u64)> {
+    interfaces
+        .iter()
+        .map(|interface| {
+            (
+                interface.info.name.clone(),
+                (
+                    interface.index,
+                    interface.info.rx_bytes,
+                    interface.info.tx_bytes,
+                ),
+            )
+        })
+        .collect()
+}
+
+/// Rates need the same name and ifindex in the previous sample; a recreated
+/// device starts again from zero.
+fn set_interface_rates(
+    interfaces: &mut [KernelInterface],
+    previous: &HashMap<String, (u32, u64, u64)>,
+    interval: f64,
+) {
+    for current in interfaces {
+        if let Some(&(old_index, rx, tx)) = previous.get(&current.info.name)
+            && old_index == current.index
+        {
+            current.info.rx_rate = counter_rate(current.info.rx_bytes, rx, interval);
+            current.info.tx_rate = counter_rate(current.info.tx_bytes, tx, interval);
+        }
     }
 }
 
@@ -509,34 +460,11 @@ impl Attribution {
         if let Some(extended) = &mut self.extended {
             extended.refresh(&self.inventory);
         }
-        self.status.dropped = self.status.dropped.saturating_add(batch.dropped);
-        self.status.overflow = self.status.overflow.saturating_add(batch.overflow);
-        self.status.unsupported = self.status.unsupported.saturating_add(batch.unsupported);
-        self.status.truncated = self.status.truncated.saturating_add(batch.truncated);
-        self.status.timestamp_invalid = self
-            .status
-            .timestamp_invalid
-            .saturating_add(batch.timestamp_invalid);
+        self.status.add_batch(&batch);
         if batch.error.is_some() {
             self.capture_error = batch.error;
         }
-        for ((flow, receive), deferred) in std::mem::take(&mut self.deferred) {
-            self.attribute(&flow, receive, deferred.bytes, deferred.since, now, &view);
-        }
-        if let Some(extended) = &mut self.extended {
-            let pending = std::mem::take(&mut extended.pending);
-            let pending_packets = std::mem::take(&mut extended.pending_packets);
-            let packets = extended.take_packets();
-            for item in pending_packets {
-                self.attribute_packet(item.packet, item.since, now);
-            }
-            for packet in packets {
-                self.attribute_packet(packet, drained, now);
-            }
-            for item in pending {
-                self.attribute_extended(item.flow, item.bytes, item.since, now, &view);
-            }
-        }
+        self.retry_waiting(drained, now, &view);
         for (flow, bytes) in batch.flows.into_iter().chain(batch.timed_flows) {
             if self.extended.as_ref().is_some_and(|e| e.available()) {
                 self.attribute_extended(flow, bytes, drained, now, &view);
@@ -549,7 +477,40 @@ impl Attribution {
                 }
             }
         }
-        for ((index, direction, socket_protocol), untracked) in batch.untracked {
+        self.count_untracked(batch.untracked, now, &view);
+    }
+
+    /// Retries deferred flows, then attributes queued and new socket packets
+    /// and queued extended flows, oldest evidence first.
+    fn retry_waiting(&mut self, drained: Instant, now: Instant, view: &LocalView) {
+        for ((flow, receive), deferred) in std::mem::take(&mut self.deferred) {
+            self.attribute(&flow, receive, deferred.bytes, deferred.since, now, view);
+        }
+        if let Some(extended) = &mut self.extended {
+            let pending = std::mem::take(&mut extended.pending);
+            let pending_packets = std::mem::take(&mut extended.pending_packets);
+            let packets = extended.take_packets();
+            for item in pending_packets {
+                self.attribute_packet(item.packet, item.since, now);
+            }
+            for packet in packets {
+                self.attribute_packet(packet, drained, now);
+            }
+            for item in pending {
+                self.attribute_extended(item.flow, item.bytes, item.since, now, view);
+            }
+        }
+    }
+
+    /// Bytes the capture could not tie to a flow. With socket packet capture,
+    /// socket-protocol bytes on a link duplicate the All-interface source.
+    fn count_untracked(
+        &mut self,
+        untracked: HashMap<(u32, Direction, bool), capture::Untracked>,
+        now: Instant,
+        view: &LocalView,
+    ) {
+        for ((index, direction, socket_protocol), untracked) in untracked {
             let bytes = match direction {
                 _ if view.loopback.contains(&index) => Bytes {
                     rx: untracked.bytes,
@@ -597,17 +558,7 @@ impl Attribution {
             self.status.attribution_overflow = self.status.attribution_overflow.saturating_add(1);
             result = extended.resolve_packet(&packet, &self.inventory, true);
         }
-        let bytes = if packet.receive != 0 {
-            Bytes {
-                rx: u64::from(packet.ip_bytes),
-                tx: 0,
-            }
-        } else {
-            Bytes {
-                rx: 0,
-                tx: u64::from(packet.ip_bytes),
-            }
-        };
+        let bytes = Bytes::one_way(packet.receive != 0, u64::from(packet.ip_bytes));
         let link = Link::plain(0);
         if let extended::PacketResult::Owned(socket, connection_known) = result
             && self.counters.record_owned(
@@ -652,60 +603,14 @@ impl Attribution {
         };
         match resolution {
             extended::Result::Owned(owners, unresolved) => {
-                for (socket, receive, lower, connection_known) in owners {
-                    let increment = if receive {
-                        Bytes {
-                            rx: bytes.bytes,
-                            tx: 0,
-                        }
-                    } else {
-                        Bytes {
-                            rx: 0,
-                            tx: bytes.bytes,
-                        }
-                    };
-                    let link = Link {
-                        index: flow.interface_index,
-                        lower: lower || selected_only,
-                    };
-                    if !self.counters.record_owned(
-                        link,
-                        &socket,
-                        connection_known,
-                        increment,
-                        now,
-                        &mut self.deltas,
-                    ) {
-                        self.counters.record_unknown(
-                            link,
-                            increment,
-                            now,
-                            &mut self.deltas.unknown,
-                        );
-                    }
-                }
-                for (receive, lower) in unresolved {
-                    let increment = if receive {
-                        Bytes {
-                            rx: bytes.bytes,
-                            tx: 0,
-                        }
-                    } else {
-                        Bytes {
-                            rx: 0,
-                            tx: bytes.bytes,
-                        }
-                    };
-                    self.counters.record_unknown(
-                        Link {
-                            index: flow.interface_index,
-                            lower: lower || selected_only,
-                        },
-                        increment,
-                        now,
-                        &mut self.deltas.unknown,
-                    );
-                }
+                self.credit_endpoints(
+                    owners,
+                    unresolved,
+                    flow.interface_index,
+                    bytes.bytes,
+                    selected_only,
+                    now,
+                );
                 return;
             }
             extended::Result::Pending if !expired && extended.pending.len() < MAX_DEFERRED => {
@@ -731,6 +636,48 @@ impl Attribution {
         );
     }
 
+    /// Credits each resolved endpoint of an extended flow; unresolved
+    /// endpoints and rejected owners count as unknown on the same link.
+    fn credit_endpoints(
+        &mut self,
+        owners: Vec<(Socket, bool, bool, bool)>,
+        unresolved: Vec<(bool, bool)>,
+        index: u32,
+        bytes: u64,
+        selected_only: bool,
+        now: Instant,
+    ) {
+        for (socket, receive, lower, connection_known) in owners {
+            let increment = Bytes::one_way(receive, bytes);
+            let link = Link {
+                index,
+                lower: lower || selected_only,
+            };
+            if !self.counters.record_owned(
+                link,
+                &socket,
+                connection_known,
+                increment,
+                now,
+                &mut self.deltas,
+            ) {
+                self.counters
+                    .record_unknown(link, increment, now, &mut self.deltas.unknown);
+            }
+        }
+        for (receive, lower) in unresolved {
+            self.counters.record_unknown(
+                Link {
+                    index,
+                    lower: lower || selected_only,
+                },
+                Bytes::one_way(receive, bytes),
+                now,
+                &mut self.deltas.unknown,
+            );
+        }
+    }
+
     /// How long a flow may wait for its socket's owner: until the next owner
     /// scan can have run. Retrying deferred flows is a hash lookup each, so a
     /// longer wait costs bounded memory (`MAX_DEFERRED`), not extra scans.
@@ -748,11 +695,7 @@ impl Attribution {
         now: Instant,
         view: &LocalView,
     ) {
-        let increment = if receive {
-            Bytes { rx: bytes, tx: 0 }
-        } else {
-            Bytes { rx: 0, tx: bytes }
-        };
+        let increment = Bytes::one_way(receive, bytes);
         let endpoints = local_socket_endpoints(flow, receive, view);
         let link = Link {
             index: flow.interface_index,
@@ -840,154 +783,6 @@ impl Attribution {
         self.counters.unattributed.retain(|link, entry| {
             links.contains(&link.index) || now.duration_since(entry.last_seen) <= COUNTER_RETENTION
         });
-    }
-
-    fn rows(
-        &self,
-        selected: Option<u32>,
-        interfaces: &[KernelInterface],
-        now: Instant,
-        interval: f64,
-        deltas: &Deltas,
-        rates_available: bool,
-    ) -> (Vec<ProcessRow>, Vec<ConnectionRow>) {
-        let mut processes: HashMap<ProcessIdentity, ProcessRow> = HashMap::new();
-        let mut connections: HashMap<(SocketKey, Option<ProcessIdentity>), ConnectionRow> =
-            HashMap::new();
-        let mut unknown = ProcessRow {
-            pid: None,
-            user: "-".to_string(),
-            name: "[unattributed]".to_string(),
-            ..ProcessRow::default()
-        };
-        let scope = selected.map(|selected| {
-            interfaces
-                .iter()
-                .find(|interface| interface.index == selected)
-        });
-        let observed_foreign: HashSet<_> = if selected.is_some() {
-            self.counters
-                .connections
-                .iter()
-                .filter(|((link, key, identity), entry)| {
-                    key.namespace != self.inventory.host_namespace()
-                        && link_in_scope(*link, selected)
-                        && (now.duration_since(entry.counter.last_seen) <= RECENT_TRAFFIC
-                            || deltas
-                                .connections
-                                .contains_key(&(*link, key.clone(), *identity)))
-                })
-                .map(|((_, key, identity), _)| (key.clone(), *identity))
-                .collect()
-        } else {
-            HashSet::new()
-        };
-        for socket in self
-            .inventory
-            .sockets
-            .iter()
-            .filter(|socket| socket.current)
-        {
-            if !socket_in_scope(socket, scope, self.inventory.host_namespace())
-                && !socket.owner().is_some_and(|owner| {
-                    observed_foreign.contains(&(socket.key.clone(), owner.identity))
-                })
-            {
-                continue;
-            }
-            let owner = socket.owner();
-            connections.insert(
-                (socket.key.clone(), owner.map(|owner| owner.identity)),
-                connection_row(socket, &self.inventory),
-            );
-            if let Some(owner) = owner {
-                processes
-                    .entry(owner.identity)
-                    .or_insert_with(|| process_row(owner))
-                    .connections += 1;
-            } else {
-                unknown.connections += 1;
-            }
-        }
-        for (&(link, identity), entry) in &self.counters.processes {
-            if !link_in_scope(link, selected) {
-                continue;
-            }
-            // Traffic within this interval stays visible even when the
-            // sockets closed more than RECENT_TRAFFIC before a long sample.
-            if !processes.contains_key(&identity)
-                && now.duration_since(entry.counter.last_seen) > RECENT_TRAFFIC
-                && !deltas.processes.contains_key(&(link, identity))
-            {
-                continue;
-            }
-            let row = processes
-                .entry(identity)
-                .or_insert_with(|| process_row(&entry.owner));
-            row.rx_bytes = row.rx_bytes.saturating_add(entry.counter.bytes.rx);
-            row.tx_bytes = row.tx_bytes.saturating_add(entry.counter.bytes.tx);
-            if rates_available && let Some(bytes) = deltas.processes.get(&(link, identity)) {
-                row.rx_rate += bytes.rx as f64 / interval;
-                row.tx_rate += bytes.tx as f64 / interval;
-            }
-        }
-        for ((link, socket_key, identity), entry) in &self.counters.connections {
-            if !link_in_scope(*link, selected) {
-                continue;
-            }
-            let key = (socket_key.clone(), Some(*identity));
-            if !connections.contains_key(&key)
-                && now.duration_since(entry.counter.last_seen) > RECENT_TRAFFIC
-                && !deltas
-                    .connections
-                    .contains_key(&(*link, socket_key.clone(), *identity))
-            {
-                continue;
-            }
-            let row = connections.entry(key).or_insert_with(|| {
-                let mut row = connection_row(&entry.socket, &self.inventory);
-                row.state = "RECENT/CLOSED".to_string();
-                row
-            });
-            row.rx_bytes = row.rx_bytes.saturating_add(entry.counter.bytes.rx);
-            row.tx_bytes = row.tx_bytes.saturating_add(entry.counter.bytes.tx);
-            if rates_available
-                && let Some(bytes) = deltas
-                    .connections
-                    .get(&(*link, socket_key.clone(), *identity))
-            {
-                row.rx_rate += bytes.rx as f64 / interval;
-                row.tx_rate += bytes.tx as f64 / interval;
-            }
-        }
-        for (&link, counter) in &self.counters.unattributed {
-            if !link_in_scope(link, selected) {
-                continue;
-            }
-            unknown.rx_bytes = unknown.rx_bytes.saturating_add(counter.bytes.rx);
-            unknown.tx_bytes = unknown.tx_bytes.saturating_add(counter.bytes.tx);
-            if rates_available && let Some(bytes) = deltas.unknown.get(&link) {
-                unknown.rx_rate += bytes.rx as f64 / interval;
-                unknown.tx_rate += bytes.tx as f64 / interval;
-            }
-        }
-        let mut rows: Vec<_> = processes.into_values().collect();
-        if unknown.connections > 0 || unknown.rx_bytes > 0 || unknown.tx_bytes > 0 {
-            rows.push(unknown);
-        }
-        rows.sort_by(|a, b| {
-            (b.rx_rate + b.tx_rate)
-                .total_cmp(&(a.rx_rate + a.tx_rate))
-                .then_with(|| a.pid.cmp(&b.pid))
-        });
-        let mut connections: Vec<_> = connections.into_values().collect();
-        connections.sort_by(|a, b| {
-            (b.rx_rate + b.tx_rate)
-                .total_cmp(&(a.rx_rate + a.tx_rate))
-                .then_with(|| a.pid.cmp(&b.pid))
-                .then_with(|| a.local.cmp(&b.local))
-        });
-        (rows, connections)
     }
 }
 
@@ -1078,216 +873,6 @@ impl Counters {
 
 fn counter_rate(current: u64, previous: u64, interval: f64) -> f64 {
     current.saturating_sub(previous) as f64 / interval
-}
-
-/// All-interface views skip lower-device duplicates of host traffic.
-fn link_in_scope(link: Link, selected: Option<u32>) -> bool {
-    selected.map_or(!link.lower, |selected| selected == link.index)
-}
-
-/// `scope` is `None` for all interfaces, `Some(None)` for a vanished one.
-fn socket_in_scope(
-    socket: &Socket,
-    scope: Option<Option<&KernelInterface>>,
-    host_namespace: u64,
-) -> bool {
-    let Some(selected) = scope else {
-        return true;
-    };
-    let Some(interface) = selected else {
-        return false;
-    };
-    // Namespace-local loopback and wildcard bindings cannot prove that a
-    // socket serves a selected host link. Foreign endpoints are added below
-    // from counters with positive observations on that exact host interface.
-    if socket.key.namespace != host_namespace {
-        return false;
-    }
-    let ip = canonical_ip(socket.key.local.ip());
-    // A wildcard is a kernel-wide binding and can serve the selected interface.
-    ip.is_unspecified() || interface_has_ip(interface, ip)
-}
-
-fn interface_has_ip(interface: &KernelInterface, ip: IpAddr) -> bool {
-    let ip = canonical_ip(ip);
-    (interface.loopback && ip.is_loopback())
-        || interface
-            .addresses
-            .iter()
-            .any(|address| canonical_ip(*address) == ip)
-}
-
-/// Host addresses and link relations, built once per attribution pass so
-/// per-flow checks are set lookups rather than scans of every interface.
-#[derive(Default)]
-struct LocalView {
-    addresses: HashSet<IpAddr>,
-    loopback: HashSet<u32>,
-    /// Links whose host traffic is also captured on an upper device.
-    lower: HashMap<u32, LowerLink>,
-}
-
-struct LowerLink {
-    /// Bridge ports and bond slaves hand every locally delivered packet to
-    /// their master, and transmit what the master sends.
-    enslaved: bool,
-    own: HashSet<IpAddr>,
-    /// Addresses of (transitive) upper devices such as VLANs or macvlans.
-    upper: HashSet<IpAddr>,
-}
-
-impl LocalView {
-    fn new(interfaces: &[KernelInterface]) -> Self {
-        let mut view = Self::default();
-        let by_index: HashMap<u32, &KernelInterface> = interfaces
-            .iter()
-            .map(|interface| (interface.index, interface))
-            .collect();
-        for interface in interfaces {
-            view.addresses
-                .extend(interface.addresses.iter().map(|ip| canonical_ip(*ip)));
-            if interface.loopback {
-                view.loopback.insert(interface.index);
-            }
-            let topology = &interface.topology;
-            if !topology.master && topology.uppers.is_empty() {
-                continue;
-            }
-            let mut upper = HashSet::new();
-            let mut pending = topology.uppers.clone();
-            let mut seen = HashSet::from([interface.index]);
-            // Stacks are shallow (VLAN on bond on ports); bound malformed loops.
-            while let Some(index) = pending.pop() {
-                if !seen.insert(index) || seen.len() > 16 {
-                    continue;
-                }
-                if let Some(device) = by_index.get(&index) {
-                    upper.extend(device.addresses.iter().map(|ip| canonical_ip(*ip)));
-                    pending.extend(&device.topology.uppers);
-                }
-            }
-            view.lower.insert(
-                interface.index,
-                LowerLink {
-                    enslaved: topology.master,
-                    own: interface
-                        .addresses
-                        .iter()
-                        .map(|ip| canonical_ip(*ip))
-                        .collect(),
-                    upper,
-                },
-            );
-        }
-        view
-    }
-
-    fn is_local(&self, ip: IpAddr) -> bool {
-        let ip = canonical_ip(ip);
-        (!self.loopback.is_empty() && ip.is_loopback()) || self.addresses.contains(&ip)
-    }
-
-    /// Host traffic for `local` seen on link `index` that its upper device
-    /// also captures, so all-interface totals would count it twice.
-    fn lower_observation(&self, index: u32, local: IpAddr) -> bool {
-        let local = canonical_ip(local);
-        self.lower.get(&index).is_some_and(|link| {
-            link.enslaved || (link.upper.contains(&local) && !link.own.contains(&local))
-        })
-    }
-}
-
-/// Traffic between two local endpoints, observed once on a loopback link.
-fn loopback_path(flow: &Flow, view: &LocalView) -> bool {
-    view.loopback.contains(&flow.interface_index)
-        || (flow.interface_index == 0
-            && view.is_local(flow.source)
-            && view.is_local(flow.destination))
-}
-
-fn traffic_sides(flow: &Flow, view: &LocalView) -> (bool, bool) {
-    if loopback_path(flow, view) {
-        // On loopback, libpcap drops the outgoing copy and keeps the incoming
-        // one; that single observation belongs to both the sender's TX and
-        // the receiver's RX, never twice to either endpoint.
-        return (true, true);
-    }
-    match flow.direction {
-        Direction::Incoming => (true, false),
-        Direction::Outgoing => (false, true),
-        Direction::Unknown => (view.is_local(flow.destination), view.is_local(flow.source)),
-    }
-}
-
-fn socket_endpoints(flow: &Flow, receive: bool) -> Option<(SocketAddr, SocketAddr)> {
-    let source = SocketAddr::new(canonical_ip(flow.source), flow.source_port?);
-    let destination = SocketAddr::new(canonical_ip(flow.destination), flow.destination_port?);
-    Some(if receive {
-        (destination, source)
-    } else {
-        (source, destination)
-    })
-}
-
-fn local_socket_endpoints(
-    flow: &Flow,
-    receive: bool,
-    view: &LocalView,
-) -> Option<(SocketAddr, SocketAddr)> {
-    let (local, remote) = socket_endpoints(flow, receive)?;
-    // Captured interface direction is not proof of a local socket endpoint.
-    // Bridges, forwarding and container links also expose nonlocal traffic;
-    // matching it to a wildcard listener merely by port assigns the wrong PID.
-    // Multicast/broadcast receiver membership is not known from /proc, so leave
-    // those receive bytes unattributed too. Sender attribution remains possible.
-    view.is_local(local.ip()).then_some((local, remote))
-}
-
-/// Docker publishes ports by DNAT in PREROUTING, but AF_PACKET observes packets
-/// before translation, so forwarded container traffic still carries the host
-/// port of docker-proxy's wildcard listener. With Docker's NAT rules that proxy
-/// only serves loopback connections, and its accepted connections match
-/// exactly. Do not credit wildcard-only matches from other links to it; the
-/// bytes stay unattributed instead of naming the wrong process.
-fn published_port_proxy(flow: &Flow, socket: &Socket, view: &LocalView) -> bool {
-    let remote = socket.key.remote;
-    remote.ip().is_unspecified()
-        && remote.port() == 0
-        && socket
-            .owner()
-            .is_some_and(|owner| owner.name == "docker-proxy")
-        && !loopback_path(flow, view)
-}
-
-fn process_row(owner: &Owner) -> ProcessRow {
-    ProcessRow {
-        pid: Some(owner.identity.pid),
-        user: owner.user.clone(),
-        name: owner.name.clone(),
-        ..ProcessRow::default()
-    }
-}
-
-fn connection_row(socket: &Socket, inventory: &Inventory) -> ConnectionRow {
-    let owner = socket.owner();
-    ConnectionRow {
-        pid: owner.map(|owner| owner.identity.pid),
-        user: owner
-            .map(|owner| owner.user.clone())
-            .unwrap_or_else(|| inventory.user(socket.uid)),
-        process: owner.map(|owner| owner.name.clone()).unwrap_or_else(|| {
-            if socket.owners.len() > 1 {
-                "[shared]".to_string()
-            } else {
-                "[unknown]".to_string()
-            }
-        }),
-        protocol: socket.key.protocol.label().to_string(),
-        local: socket.key.local.to_string(),
-        remote: socket.key.remote.to_string(),
-        state: socket.state.clone(),
-        ..ConnectionRow::default()
-    }
 }
 
 #[cfg(test)]

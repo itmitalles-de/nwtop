@@ -36,22 +36,44 @@ pub(super) fn draw_setup(frame: &mut Frame<'_>, app: &App, area: Rect) {
         Constraint::Length(1),
     ])
     .split(area);
-    // Room for the longest category and the focus marker " >".
-    let category_width = names
-        .iter()
-        .map(|name| name.chars().count() as u16 + 2)
-        .max()
-        .unwrap_or(0)
-        .max(12);
     let panes = Layout::horizontal([
-        Constraint::Length(category_width),
+        Constraint::Length(category_pane_width(&names)),
         Constraint::Length(1),
         Constraint::Min(20),
     ])
     .split(vertical[0]);
+    draw_setup_categories(frame, app, &names, panes[0]);
+    draw_setup_options(frame, app, names[app.setup_category], panes[2]);
+    frame.render_widget(
+        // Default foreground keeps the description readable on light themes.
+        Paragraph::new(setup_description(
+            app.setup_category,
+            app.setup_option,
+            lang,
+        ))
+        .wrap(Wrap { trim: true }),
+        vertical[1],
+    );
+    draw_setup_status(frame, app, vertical[2]);
+    draw_setup_keys(frame, lang, area.width, vertical[3]);
+}
+
+/// Room for the longest category and the focus marker " >".
+fn category_pane_width(names: &[&str]) -> u16 {
+    names
+        .iter()
+        .map(|name| name.chars().count() as u16 + 2)
+        .max()
+        .unwrap_or(0)
+        .max(12)
+}
+
+/// The "Setup" title above the category list; the current category is
+/// inverted while the list has focus and bold with " >" while its options do.
+fn draw_setup_categories(frame: &mut Frame<'_>, app: &App, names: &[&str], pane: Rect) {
     frame.render_widget(
         Paragraph::new("Setup").style(inverse(Color::Green)),
-        Rect::new(panes[0].x, panes[0].y, panes[0].width, 1),
+        Rect::new(pane.x, pane.y, pane.width, 1),
     );
     for (index, name) in names.iter().enumerate() {
         let current = app.setup_category == index;
@@ -69,125 +91,21 @@ pub(super) fn draw_setup(frame: &mut Frame<'_>, app: &App, area: Rect) {
         };
         frame.render_widget(
             Paragraph::new(text).style(style),
-            Rect::new(panes[0].x, panes[0].y + index as u16 + 1, panes[0].width, 1),
+            Rect::new(pane.x, pane.y + index as u16 + 1, pane.width, 1),
         );
     }
-    let check = |enabled| if enabled { "[*]" } else { "[ ]" };
-    let options: Vec<String> = match app.setup_category {
-        0 => vec![
-            format!(
-                "{} {}",
-                check(app.settings.color),
-                lang.pick("Color", "Farbe")
-            ),
-            format!(
-                "[{:.1}s] {}",
-                app.settings.interval_ms as f64 / 1000.0,
-                lang.pick("Update interval", "Aktualisierung")
-            ),
-            format!(
-                "{} {}",
-                check(app.settings.bits),
-                lang.pick("Rates in bits/s", "Raten in Bit/s")
-            ),
-            format!(
-                "[{}] {}",
-                match app.settings.language {
-                    Language::Auto => "Auto",
-                    Language::En => "English",
-                    Language::De => "Deutsch",
-                },
-                lang.pick("Language", "Sprache")
-            ),
-        ],
-        1 => {
-            let mut rows = vec![
-                format!(
-                    "{} Auto ({})",
-                    check(app.settings.interface.is_none()),
-                    app.auto_interface
-                        .as_deref()
-                        .unwrap_or(lang.pick("all", "alle"))
-                ),
-                format!(
-                    "{} {}",
-                    check(app.settings.interface.as_deref() == Some("all")),
-                    lang.pick("All interfaces", "Alle")
-                ),
-            ];
-            rows.extend(app.snapshot.interfaces.iter().map(|iface| {
-                format!(
-                    "{} {} ({})",
-                    check(app.settings.interface.as_deref() == Some(&iface.name)),
-                    iface.name,
-                    iface.state
-                )
-            }));
-            rows
-        }
-        2 => vec![
-            format!(
-                "{} {}",
-                check(app.settings.show_graph),
-                lang.pick("Show graph", "Diagramm zeigen")
-            ),
-            format!(
-                "[{}s] {}",
-                app.settings.history_seconds,
-                lang.pick("History", "Verlauf")
-            ),
-            format!(
-                "[{}] {}",
-                match (app.settings.graph_style, lang) {
-                    (GraphStyle::Steps, Lang::De) => "Stufen",
-                    (style, _) => style.label(),
-                },
-                lang.pick("Drawing", "Zeichnung")
-            ),
-            format!(
-                "[{}] {}",
-                plot_color_label(app.settings.rx_color, lang),
-                lang.pick("Receive color", "Empfangsfarbe")
-            ),
-            format!(
-                "[{}] {}",
-                plot_color_label(app.settings.tx_color, lang),
-                lang.pick("Send color", "Sendefarbe")
-            ),
-        ],
-        _ => vec![
-            format!(
-                "[{}] {}",
-                if app.settings.connections {
-                    lang.pick("Connections", "Verbindungen")
-                } else {
-                    lang.pick("Processes", "Prozesse")
-                },
-                lang.pick("View", "Ansicht")
-            ),
-            format!(
-                "[{}] {}",
-                app.settings.sort.label(lang),
-                lang.pick("Sort by", "Sortierung")
-            ),
-            format!(
-                "{} {}",
-                check(app.settings.show_idle),
-                lang.pick("Show idle rows", "Inaktive Zeilen zeigen")
-            ),
-        ],
+}
+
+/// Option rows of the current category; a row is selected only with focus.
+fn draw_setup_options(frame: &mut Frame<'_>, app: &App, name: &str, pane: Rect) {
+    let lang = app.lang();
+    let options = match app.setup_category {
+        0 => general_options(app, lang),
+        1 => interface_options(app, lang),
+        2 => chart_options(app, lang),
+        _ => process_options(app, lang),
     };
-    let name = names[app.setup_category];
-    let header = match lang {
-        Lang::En => format!("{name} Options"),
-        Lang::De => format!("Optionen: {name}"),
-    };
-    // Narrow terminals show just the category rather than a cut-off header.
-    let header = if header.chars().count() > usize::from(panes[2].width) {
-        name.to_owned()
-    } else {
-        header
-    };
+    let header = options_header(name, lang, pane.width);
     let mut state =
         TableState::default().with_selected(app.setup_focus.then_some(app.setup_option));
     let table = Table::new(
@@ -196,8 +114,142 @@ pub(super) fn draw_setup(frame: &mut Frame<'_>, app: &App, area: Rect) {
     )
     .header(Row::new([header]).style(inverse(Color::Green)))
     .row_highlight_style(inverse(KEY));
-    frame.render_stateful_widget(table, panes[2], &mut state);
-    let description = match (app.setup_category, app.setup_option) {
+    frame.render_stateful_widget(table, pane, &mut state);
+}
+
+fn options_header(name: &str, lang: Lang, width: u16) -> String {
+    let header = match lang {
+        Lang::En => format!("{name} Options"),
+        Lang::De => format!("Optionen: {name}"),
+    };
+    // Narrow terminals show just the category rather than a cut-off header.
+    if header.chars().count() > usize::from(width) {
+        name.to_owned()
+    } else {
+        header
+    }
+}
+
+fn checkbox(enabled: bool) -> &'static str {
+    if enabled { "[*]" } else { "[ ]" }
+}
+
+fn general_options(app: &App, lang: Lang) -> Vec<String> {
+    vec![
+        format!(
+            "{} {}",
+            checkbox(app.settings.color),
+            lang.pick("Color", "Farbe")
+        ),
+        format!(
+            "[{:.1}s] {}",
+            app.settings.interval_ms as f64 / 1000.0,
+            lang.pick("Update interval", "Aktualisierung")
+        ),
+        format!(
+            "{} {}",
+            checkbox(app.settings.bits),
+            lang.pick("Rates in bits/s", "Raten in Bit/s")
+        ),
+        format!(
+            "[{}] {}",
+            match app.settings.language {
+                Language::Auto => "Auto",
+                Language::En => "English",
+                Language::De => "Deutsch",
+            },
+            lang.pick("Language", "Sprache")
+        ),
+    ]
+}
+
+/// Auto, all interfaces, then one row per known interface.
+fn interface_options(app: &App, lang: Lang) -> Vec<String> {
+    let mut rows = vec![
+        format!(
+            "{} Auto ({})",
+            checkbox(app.settings.interface.is_none()),
+            app.auto_interface
+                .as_deref()
+                .unwrap_or(lang.pick("all", "alle"))
+        ),
+        format!(
+            "{} {}",
+            checkbox(app.settings.interface.as_deref() == Some("all")),
+            lang.pick("All interfaces", "Alle")
+        ),
+    ];
+    rows.extend(app.snapshot.interfaces.iter().map(|iface| {
+        format!(
+            "{} {} ({})",
+            checkbox(app.settings.interface.as_deref() == Some(&iface.name)),
+            iface.name,
+            iface.state
+        )
+    }));
+    rows
+}
+
+fn chart_options(app: &App, lang: Lang) -> Vec<String> {
+    vec![
+        format!(
+            "{} {}",
+            checkbox(app.settings.show_graph),
+            lang.pick("Show graph", "Diagramm zeigen")
+        ),
+        format!(
+            "[{}s] {}",
+            app.settings.history_seconds,
+            lang.pick("History", "Verlauf")
+        ),
+        format!(
+            "[{}] {}",
+            match (app.settings.graph_style, lang) {
+                (GraphStyle::Steps, Lang::De) => "Stufen",
+                (style, _) => style.label(),
+            },
+            lang.pick("Drawing", "Zeichnung")
+        ),
+        format!(
+            "[{}] {}",
+            plot_color_label(app.settings.rx_color, lang),
+            lang.pick("Receive color", "Empfangsfarbe")
+        ),
+        format!(
+            "[{}] {}",
+            plot_color_label(app.settings.tx_color, lang),
+            lang.pick("Send color", "Sendefarbe")
+        ),
+    ]
+}
+
+fn process_options(app: &App, lang: Lang) -> Vec<String> {
+    vec![
+        format!(
+            "[{}] {}",
+            if app.settings.connections {
+                lang.pick("Connections", "Verbindungen")
+            } else {
+                lang.pick("Processes", "Prozesse")
+            },
+            lang.pick("View", "Ansicht")
+        ),
+        format!(
+            "[{}] {}",
+            app.settings.sort.label(lang),
+            lang.pick("Sort by", "Sortierung")
+        ),
+        format!(
+            "{} {}",
+            checkbox(app.settings.show_idle),
+            lang.pick("Show idle rows", "Inaktive Zeilen zeigen")
+        ),
+    ]
+}
+
+/// Explanation of the option at (category, option), shown below the panes.
+fn setup_description(category: usize, option: usize, lang: Lang) -> &'static str {
+    match (category, option) {
         (0, 0) => lang.pick(
             "Use the terminal's own ANSI palette. Selection stays visible in monochrome.",
             "Nutzt die ANSI-Palette des Terminals. Die Auswahl bleibt auch einfarbig sichtbar.",
@@ -246,12 +298,13 @@ pub(super) fn draw_setup(frame: &mut Frame<'_>, app: &App, area: Rect) {
             "Include sockets and processes with no traffic in the current sample.",
             "Zeigt auch Sockets und Prozesse ohne Verkehr in der aktuellen Messung.",
         ),
-    };
-    frame.render_widget(
-        // Default foreground keeps the description readable on light themes.
-        Paragraph::new(description).wrap(Wrap { trim: true }),
-        vertical[1],
-    );
+    }
+}
+
+/// The current notice (red for errors), else the unsaved-changes hint or the
+/// navigation hint, in yellow.
+fn draw_setup_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let lang = app.lang();
     let message = app.notice.clone().unwrap_or_else(|| {
         if app.settings_dirty() {
             lang.pick(
@@ -275,18 +328,21 @@ pub(super) fn draw_setup(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 Color::Yellow
             },
         )),
-        vertical[2],
+        area,
     );
+}
+
+fn draw_setup_keys(frame: &mut Frame<'_>, lang: Lang, width: u16, area: Rect) {
     draw_key_bar(
         frame,
-        vertical[3],
+        area,
         &[
             ("Tab", lang.pick("Panel", "Feld")),
             ("Ent", lang.pick("Change", "Ändern")),
             ("F10", lang.pick("Done", "Fertig")),
             (
                 "F12",
-                if area.width >= 40 {
+                if width >= 40 {
                     lang.pick("Save", "Speichern")
                 } else {
                     lang.pick("Save", "Speich")
@@ -328,7 +384,35 @@ pub(super) fn draw_help(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let area = popup(area, 76, 23);
     frame.render_widget(Clear, area);
     let lang = app.lang();
-    let lines: &[&str] = match lang {
+    let mut text: Vec<Line<'_>> = help_lines(lang)
+        .iter()
+        .map(|line| Line::from(*line))
+        .collect();
+    text.push(Line::from(
+        lang.capture_status(&app.snapshot.capture, true)
+            .unwrap_or_else(|| app.snapshot.capture.message.clone()),
+    ));
+    frame.render_widget(
+        Paragraph::new(text)
+            .wrap(Wrap { trim: false })
+            .scroll((app.help_scroll, 0))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(KEY))
+                    .title(lang.pick(
+                        " Help  Up/Down scroll / Esc close ",
+                        " Hilfe  Hoch/Runter blättert / Esc schließt ",
+                    )),
+            )
+            .style(Style::default()),
+        area,
+    );
+}
+
+/// Key reference and data notes; the live capture status follows them.
+fn help_lines(lang: Lang) -> &'static [&'static str] {
+    match lang {
         Lang::En => &[
             "F1 / ?         Help     Esc closes",
             "F2             Setup: General, Interface, Chart, Processes",
@@ -381,28 +465,7 @@ pub(super) fn draw_help(frame: &mut Frame<'_>, app: &App, area: Rect) {
             "Danach nwtop ohne sudo starten.",
             "",
         ],
-    };
-    let mut text: Vec<Line<'_>> = lines.iter().map(|line| Line::from(*line)).collect();
-    text.push(Line::from(
-        lang.capture_status(&app.snapshot.capture, true)
-            .unwrap_or_else(|| app.snapshot.capture.message.clone()),
-    ));
-    frame.render_widget(
-        Paragraph::new(text)
-            .wrap(Wrap { trim: false })
-            .scroll((app.help_scroll, 0))
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(KEY))
-                    .title(lang.pick(
-                        " Help  Up/Down scroll / Esc close ",
-                        " Hilfe  Hoch/Runter blättert / Esc schließt ",
-                    )),
-            )
-            .style(Style::default()),
-        area,
-    );
+    }
 }
 
 pub(super) fn draw_interfaces(frame: &mut Frame<'_>, app: &App, area: Rect) {
