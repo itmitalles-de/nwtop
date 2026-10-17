@@ -90,8 +90,88 @@ fn direction(packet_type: u16) -> Direction {
     }
 }
 
+/// The parsed network header. `fragment` is (first fragment, identification,
+/// protocol of the fragmented payload).
+struct IpHeader {
+    source: IpAddr,
+    destination: IpAddr,
+    protocol: u8,
+    transport_offset: usize,
+    ports_present: bool,
+    bytes: u64,
+    fragment: Option<(bool, u32, u8)>,
+}
+
 pub(super) fn parse(data: &[u8], wire_length: u32, datalink: i32) -> Result<Packet, ParseError> {
-    let (mut offset, mut ethertype, interface_index, direction) = match datalink {
+    let (mut offset, mut ethertype, interface_index, direction) = link_header(data, datalink)?;
+    // Handle nested 802.1Q and 802.1ad tags with a finite header walk.
+    for _ in 0..4 {
+        if !matches!(ethertype, 0x8100 | 0x88a8 | 0x9100) {
+            break;
+        }
+        ethertype = u16_at(data, offset + 2)?;
+        offset += 4;
+    }
+    let ip = data.get(offset..).ok_or(ParseError::Truncated)?;
+    let available = wire_length.saturating_sub(offset as u32);
+    let header = match ethertype {
+        0x0800 => ipv4_header(ip, available)?,
+        0x86dd => ipv6_header(ip, available)?,
+        _ => return Err(ParseError::Unsupported),
+    };
+    let IpHeader {
+        source,
+        destination,
+        transport_offset,
+        ports_present,
+        bytes,
+        ..
+    } = header;
+    let protocol = Protocol::from_number(header.protocol);
+    let (source_port, destination_port) =
+        if ports_present && matches!(protocol, Protocol::Tcp | Protocol::Udp) {
+            // Only the first four transport bytes are needed; no payload is copied.
+            if transport_offset + 4 > bytes as usize {
+                return Err(ParseError::Invalid);
+            }
+            (
+                Some(u16_at(ip, transport_offset)?),
+                Some(u16_at(ip, transport_offset + 2)?),
+            )
+        } else {
+            (None, None)
+        };
+    let fragment = header.fragment.and_then(|(first, id, fragment_protocol)| {
+        let key = FragmentKey {
+            source,
+            destination,
+            id,
+            protocol: fragment_protocol,
+        };
+        if !first {
+            Some(Fragment::Later(key))
+        } else {
+            source_port.map(|_| Fragment::First(key))
+        }
+    });
+    Ok(Packet {
+        flow: Flow {
+            source,
+            destination,
+            source_port,
+            destination_port,
+            protocol,
+            interface_index,
+            direction,
+        },
+        bytes,
+        fragment,
+    })
+}
+
+/// The link-layer header length, ethertype, interface index and direction.
+fn link_header(data: &[u8], datalink: i32) -> Result<(usize, u16, u32, Direction), ParseError> {
+    Ok(match datalink {
         // Linux cooked v2 includes the actual interface index, unlike SLL1.
         276 => {
             let header = data.get(..20).ok_or(ParseError::Truncated)?;
@@ -121,166 +201,119 @@ pub(super) fn parse(data: &[u8], wire_length: u32, datalink: i32) -> Result<Pack
             (0, ethertype, 0, Direction::Unknown)
         }
         _ => return Err(ParseError::Unsupported),
+    })
+}
+
+/// `available` is the captured wire length from the IP header on.
+fn ipv4_header(ip: &[u8], available: u32) -> Result<IpHeader, ParseError> {
+    let header = ip.get(..20).ok_or(ParseError::Truncated)?;
+    if header[0] >> 4 != 4 {
+        return Err(ParseError::Invalid);
+    }
+    let header_length = (header[0] & 15) as usize * 4;
+    if header_length < 20 {
+        return Err(ParseError::Invalid);
+    }
+    ip.get(..header_length).ok_or(ParseError::Truncated)?;
+    let total_length = u16_at(header, 2)? as usize;
+    let available = available as usize;
+    // Linux BIG TCP/GSO exposes IPv4 super-packets above 64 KiB with a
+    // zero total length, like IPv6 jumbo frames with payload length 0.
+    let length = if total_length == 0 && available > 65_535 {
+        available
+    } else {
+        total_length
     };
-    // Handle nested 802.1Q and 802.1ad tags with a finite header walk.
-    for _ in 0..4 {
-        if !matches!(ethertype, 0x8100 | 0x88a8 | 0x9100) {
+    if length < header_length || length > available {
+        return Err(ParseError::Invalid);
+    }
+    let source = IpAddr::V4(Ipv4Addr::new(
+        header[12], header[13], header[14], header[15],
+    ));
+    let destination = IpAddr::V4(Ipv4Addr::new(
+        header[16], header[17], header[18], header[19],
+    ));
+    let flags_offset = u16_at(header, 6)?;
+    let first_fragment = flags_offset & 0x1fff == 0;
+    let fragment = if !first_fragment || flags_offset & 0x2000 != 0 {
+        Some((first_fragment, u32::from(u16_at(header, 4)?), header[9]))
+    } else {
+        None
+    };
+    Ok(IpHeader {
+        source,
+        destination,
+        protocol: header[9],
+        transport_offset: header_length,
+        ports_present: first_fragment,
+        bytes: length as u64,
+        fragment,
+    })
+}
+
+/// `available` is the captured wire length from the IP header on.
+fn ipv6_header(ip: &[u8], available: u32) -> Result<IpHeader, ParseError> {
+    let header = ip.get(..40).ok_or(ParseError::Truncated)?;
+    if header[0] >> 4 != 6 {
+        return Err(ParseError::Invalid);
+    }
+    let payload_length = u16_at(header, 4)? as u64;
+    // Linux may expose large, offloaded frames before segmentation.
+    let length = if payload_length == 0 {
+        available as u64
+    } else {
+        payload_length + 40
+    };
+    if length < 40 || length > available as u64 {
+        return Err(ParseError::Invalid);
+    }
+    let source = IpAddr::V6(Ipv6Addr::from(
+        <[u8; 16]>::try_from(&header[8..24]).unwrap(),
+    ));
+    let destination = IpAddr::V6(Ipv6Addr::from(
+        <[u8; 16]>::try_from(&header[24..40]).unwrap(),
+    ));
+    let mut protocol = header[6];
+    let mut cursor = 40;
+    let mut first_fragment = true;
+    let mut fragment = None;
+    for _ in 0..8 {
+        let extension_length = match protocol {
+            0 | 43 | 60 => (*ip.get(cursor + 1).ok_or(ParseError::Truncated)? as usize + 1) * 8,
+            51 => (*ip.get(cursor + 1).ok_or(ParseError::Truncated)? as usize + 2) * 4,
+            44 => {
+                let offset_flags = u16_at(ip, cursor + 2)?;
+                first_fragment = offset_flags & 0xfff8 == 0;
+                let id = ip
+                    .get(cursor + 4..cursor + 8)
+                    .ok_or(ParseError::Truncated)?;
+                // Atomic fragments (offset 0, no M flag) need no cache.
+                if !first_fragment || offset_flags & 1 != 0 {
+                    fragment = Some((
+                        first_fragment,
+                        u32::from_be_bytes(id.try_into().unwrap()),
+                        ip[cursor],
+                    ));
+                }
+                8
+            }
+            _ => break,
+        };
+        ip.get(cursor..cursor + extension_length)
+            .ok_or(ParseError::Truncated)?;
+        protocol = ip[cursor];
+        cursor += extension_length;
+        if !first_fragment {
             break;
         }
-        ethertype = u16_at(data, offset + 2)?;
-        offset += 4;
     }
-    let ip = data.get(offset..).ok_or(ParseError::Truncated)?;
-    // (first fragment, identification, protocol of the fragmented payload)
-    let mut fragment: Option<(bool, u32, u8)> = None;
-    let (source, destination, protocol, transport_offset, ports_present, bytes) = match ethertype {
-        0x0800 => {
-            let header = ip.get(..20).ok_or(ParseError::Truncated)?;
-            if header[0] >> 4 != 4 {
-                return Err(ParseError::Invalid);
-            }
-            let header_length = (header[0] & 15) as usize * 4;
-            if header_length < 20 {
-                return Err(ParseError::Invalid);
-            }
-            ip.get(..header_length).ok_or(ParseError::Truncated)?;
-            let total_length = u16_at(header, 2)? as usize;
-            let available = wire_length.saturating_sub(offset as u32) as usize;
-            // Linux BIG TCP/GSO exposes IPv4 super-packets above 64 KiB with a
-            // zero total length, like IPv6 jumbo frames with payload length 0.
-            let length = if total_length == 0 && available > 65_535 {
-                available
-            } else {
-                total_length
-            };
-            if length < header_length || length > available {
-                return Err(ParseError::Invalid);
-            }
-            let source = IpAddr::V4(Ipv4Addr::new(
-                header[12], header[13], header[14], header[15],
-            ));
-            let destination = IpAddr::V4(Ipv4Addr::new(
-                header[16], header[17], header[18], header[19],
-            ));
-            let flags_offset = u16_at(header, 6)?;
-            let first_fragment = flags_offset & 0x1fff == 0;
-            if !first_fragment || flags_offset & 0x2000 != 0 {
-                fragment = Some((first_fragment, u32::from(u16_at(header, 4)?), header[9]));
-            }
-            (
-                source,
-                destination,
-                header[9],
-                header_length,
-                first_fragment,
-                length as u64,
-            )
-        }
-        0x86dd => {
-            let header = ip.get(..40).ok_or(ParseError::Truncated)?;
-            if header[0] >> 4 != 6 {
-                return Err(ParseError::Invalid);
-            }
-            let payload_length = u16_at(header, 4)? as u64;
-            // Linux may expose large, offloaded frames before segmentation.
-            let length = if payload_length == 0 {
-                wire_length.saturating_sub(offset as u32) as u64
-            } else {
-                payload_length + 40
-            };
-            if length < 40 || length > wire_length.saturating_sub(offset as u32) as u64 {
-                return Err(ParseError::Invalid);
-            }
-            let source = IpAddr::V6(Ipv6Addr::from(
-                <[u8; 16]>::try_from(&header[8..24]).unwrap(),
-            ));
-            let destination = IpAddr::V6(Ipv6Addr::from(
-                <[u8; 16]>::try_from(&header[24..40]).unwrap(),
-            ));
-            let mut protocol = header[6];
-            let mut cursor = 40;
-            let mut first_fragment = true;
-            for _ in 0..8 {
-                let extension_length = match protocol {
-                    0 | 43 | 60 => {
-                        (*ip.get(cursor + 1).ok_or(ParseError::Truncated)? as usize + 1) * 8
-                    }
-                    51 => (*ip.get(cursor + 1).ok_or(ParseError::Truncated)? as usize + 2) * 4,
-                    44 => {
-                        let offset_flags = u16_at(ip, cursor + 2)?;
-                        first_fragment = offset_flags & 0xfff8 == 0;
-                        let id = ip
-                            .get(cursor + 4..cursor + 8)
-                            .ok_or(ParseError::Truncated)?;
-                        // Atomic fragments (offset 0, no M flag) need no cache.
-                        if !first_fragment || offset_flags & 1 != 0 {
-                            fragment = Some((
-                                first_fragment,
-                                u32::from_be_bytes(id.try_into().unwrap()),
-                                ip[cursor],
-                            ));
-                        }
-                        8
-                    }
-                    _ => break,
-                };
-                ip.get(cursor..cursor + extension_length)
-                    .ok_or(ParseError::Truncated)?;
-                protocol = ip[cursor];
-                cursor += extension_length;
-                if !first_fragment {
-                    break;
-                }
-            }
-            (
-                source,
-                destination,
-                protocol,
-                cursor,
-                first_fragment,
-                length,
-            )
-        }
-        _ => return Err(ParseError::Unsupported),
-    };
-    let protocol = Protocol::from_number(protocol);
-    let (source_port, destination_port) =
-        if ports_present && matches!(protocol, Protocol::Tcp | Protocol::Udp) {
-            // Only the first four transport bytes are needed; no payload is copied.
-            if transport_offset + 4 > bytes as usize {
-                return Err(ParseError::Invalid);
-            }
-            (
-                Some(u16_at(ip, transport_offset)?),
-                Some(u16_at(ip, transport_offset + 2)?),
-            )
-        } else {
-            (None, None)
-        };
-    let fragment = fragment.and_then(|(first, id, fragment_protocol)| {
-        let key = FragmentKey {
-            source,
-            destination,
-            id,
-            protocol: fragment_protocol,
-        };
-        if !first {
-            Some(Fragment::Later(key))
-        } else {
-            source_port.map(|_| Fragment::First(key))
-        }
-    });
-    Ok(Packet {
-        flow: Flow {
-            source,
-            destination,
-            source_port,
-            destination_port,
-            protocol,
-            interface_index,
-            direction,
-        },
-        bytes,
+    Ok(IpHeader {
+        source,
+        destination,
+        protocol,
+        transport_offset: cursor,
+        ports_present: first_fragment,
+        bytes: length,
         fragment,
     })
 }

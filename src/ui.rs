@@ -237,6 +237,7 @@ impl App {
     }
 
     fn handle_key_inner(&mut self, key: KeyEvent) -> Action {
+        // Quit and save work everywhere and keep the current notice visible.
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             return Action::Quit;
         }
@@ -244,6 +245,7 @@ impl App {
             return Action::SaveSettings;
         }
         self.notice = None;
+        // Setup closes on F10 instead of quitting.
         if self.overlay == Overlay::Setup {
             return self.setup_key(key);
         }
@@ -254,27 +256,36 @@ impl App {
             return self.overlay_key(key);
         }
         if self.searching {
-            match key.code {
-                KeyCode::Esc => {
-                    self.searching = false;
-                    self.filter.clear();
-                }
-                KeyCode::Enter => self.searching = false,
-                KeyCode::Backspace => {
-                    self.filter.pop();
-                }
-                KeyCode::Char(c)
-                    if !key.modifiers.contains(KeyModifiers::CONTROL)
-                        && self.filter.len() < 256 =>
-                {
-                    // Bound input even when pasted by a terminal.
-                    self.filter.push(c);
-                }
-                _ => {}
-            }
-            self.table.select(Some(0));
+            self.search_key(key);
             return Action::None;
         }
+        self.monitor_key(key)
+    }
+
+    /// Edits the search filter; every key restarts the selection at the top.
+    fn search_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                self.searching = false;
+                self.filter.clear();
+            }
+            KeyCode::Enter => self.searching = false,
+            KeyCode::Backspace => {
+                self.filter.pop();
+            }
+            KeyCode::Char(c)
+                if !key.modifiers.contains(KeyModifiers::CONTROL) && self.filter.len() < 256 =>
+            {
+                // Bound input even when pasted by a terminal.
+                self.filter.push(c);
+            }
+            _ => {}
+        }
+        self.table.select(Some(0));
+    }
+
+    /// Keys of the main monitor view without an open overlay or search.
+    fn monitor_key(&mut self, key: KeyEvent) -> Action {
         match key.code {
             KeyCode::Char('q') => return Action::Quit,
             KeyCode::F(1) | KeyCode::Char('?') => {
@@ -285,44 +296,14 @@ impl App {
                 self.overlay = Overlay::Setup;
                 self.setup_focus = false;
             }
-            KeyCode::F(5) | KeyCode::Char('i') => {
-                self.overlay = Overlay::Interfaces;
-                self.picker = self
-                    .snapshot
-                    .interfaces
-                    .iter()
-                    .position(|iface| Some(iface.name.as_str()) == self.interface.as_deref())
-                    .map_or(0, |index| index + 1);
-            }
+            KeyCode::F(5) | KeyCode::Char('i') => self.open_interface_picker(),
             KeyCode::Tab | KeyCode::BackTab => {
-                let names: Vec<_> = self
-                    .snapshot
-                    .interfaces
-                    .iter()
-                    .filter(|iface| iface.state == "up" || iface.name == "lo")
-                    .map(|iface| iface.name.clone())
-                    .collect();
-                if !names.is_empty() {
-                    let current = names
-                        .iter()
-                        .position(|name| Some(name) == self.interface.as_ref());
-                    let next = match (current, key.code == KeyCode::BackTab) {
-                        (Some(index), true) => (index + names.len() - 1) % names.len(),
-                        (Some(index), false) => (index + 1) % names.len(),
-                        (None, true) => names.len() - 1,
-                        (None, false) => 0,
-                    };
-                    self.set_interface(Some(names[next].clone()));
-                    return Action::InterfaceChanged;
-                }
+                return self.cycle_interface(key.code == KeyCode::BackTab);
             }
             KeyCode::F(3) | KeyCode::Char('/') => self.searching = true,
             KeyCode::F(6) => {
                 self.overlay = Overlay::Sort;
-                self.picker = SORTS
-                    .iter()
-                    .position(|sort| *sort == self.settings.sort)
-                    .unwrap_or(0);
+                self.picker = self.sort_index();
             }
             KeyCode::Char('s') => {
                 self.settings.sort = self.settings.sort.next();
@@ -344,6 +325,50 @@ impl App {
             _ => {}
         }
         Action::None
+    }
+
+    /// Opens the interface overlay on the current device; row 0 is "all".
+    fn open_interface_picker(&mut self) {
+        self.overlay = Overlay::Interfaces;
+        self.picker = self
+            .snapshot
+            .interfaces
+            .iter()
+            .position(|iface| Some(iface.name.as_str()) == self.interface.as_deref())
+            .map_or(0, |index| index + 1);
+    }
+
+    /// Switches to the next or previous interface that is up, or loopback.
+    fn cycle_interface(&mut self, backward: bool) -> Action {
+        let names: Vec<_> = self
+            .snapshot
+            .interfaces
+            .iter()
+            .filter(|iface| iface.state == "up" || iface.name == "lo")
+            .map(|iface| iface.name.clone())
+            .collect();
+        if names.is_empty() {
+            return Action::None;
+        }
+        let current = names
+            .iter()
+            .position(|name| Some(name) == self.interface.as_ref());
+        let next = match (current, backward) {
+            (Some(index), true) => (index + names.len() - 1) % names.len(),
+            (Some(index), false) => (index + 1) % names.len(),
+            (None, true) => names.len() - 1,
+            (None, false) => 0,
+        };
+        self.set_interface(Some(names[next].clone()));
+        Action::InterfaceChanged
+    }
+
+    /// Position of the current sort order in `SORTS`.
+    fn sort_index(&self) -> usize {
+        SORTS
+            .iter()
+            .position(|sort| *sort == self.settings.sort)
+            .unwrap_or(0)
     }
 
     fn overlay_key(&mut self, key: KeyEvent) -> Action {
@@ -514,10 +539,7 @@ impl App {
             (2, 4) => self.settings.tx_color = self.settings.tx_color.next(direction),
             (3, 0) => self.settings.connections = !self.settings.connections,
             (3, 1) => {
-                let current = SORTS
-                    .iter()
-                    .position(|sort| *sort == self.settings.sort)
-                    .unwrap_or(0) as i32;
+                let current = self.sort_index() as i32;
                 self.settings.sort =
                     SORTS[(current + direction).rem_euclid(SORTS.len() as i32) as usize];
             }

@@ -1,6 +1,6 @@
 use super::render::status_line;
 use super::*;
-use crate::config::Language;
+use crate::config::{GraphStyle, Language};
 use ratatui::{Terminal, backend::TestBackend, style::Color};
 
 fn app() -> App {
@@ -398,4 +398,356 @@ fn graph_time_labels_stay_visible_and_hiding_graph_frees_rows() {
     app.settings.show_graph = false;
     terminal.draw(|frame| draw(frame, &mut app)).unwrap();
     assert!(app.visible_rows > with_graph);
+}
+
+const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+
+/// FNV-1a keeps recorded hashes independent of Rust's DefaultHasher.
+fn fnv(hash: u64, text: &str) -> u64 {
+    text.bytes().fold(hash, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
+    })
+}
+
+fn draw_hash(hash: u64, app: &mut App, width: u16, height: u16) -> u64 {
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+    terminal.draw(|frame| draw(frame, app)).unwrap();
+    // Symbols, colors and modifiers of every cell, plus the derived row count.
+    let cells = format!(
+        "{:?} {}",
+        terminal.backend().buffer().content,
+        app.visible_rows
+    );
+    fnv(hash, &cells)
+}
+
+#[test]
+fn table_layouts_render_the_same_cells_at_every_width_breakpoint() {
+    // Recorded on the unmodified renderer at 1f3af1c.
+    let mut hash = FNV_OFFSET;
+    for language in [Language::En, Language::De] {
+        for width in [36, 40, 51, 52, 63, 64, 93, 94, 120] {
+            for connections in [false, true] {
+                for captured in [true, false] {
+                    for rows in ["all", "filtered", "none"] {
+                        let mut app = app();
+                        app.settings.language = language;
+                        app.settings.connections = connections;
+                        app.settings.bits = width % 2 == 1;
+                        if !captured {
+                            app.demo = false;
+                            app.snapshot.capture.active = false;
+                        }
+                        match rows {
+                            "filtered" => app.filter = "no-such-row".into(),
+                            "none" => {
+                                app.snapshot.processes.clear();
+                                app.snapshot.connections.clear();
+                            }
+                            _ => app.table.select(Some(2)),
+                        }
+                        hash = draw_hash(hash, &mut app, width, 20);
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(hash, 10712350386198292355);
+}
+
+#[test]
+fn step_and_braille_graphs_render_the_same_cells_for_edge_histories() {
+    // Recorded on the unmodified renderer at 1f3af1c.
+    let mut hash = FNV_OFFSET;
+    for style in [GraphStyle::Steps, GraphStyle::Braille] {
+        for (width, height) in [(36, 16), (40, 24), (44, 20), (60, 30), (120, 40)] {
+            for history in ["demo", "empty", "single", "stale", "extremes", "long"] {
+                let mut app = app();
+                app.settings.graph_style = style;
+                app.settings.bits = height % 2 == 0;
+                match history {
+                    "empty" => app.history.clear(),
+                    "single" => {
+                        app.history.clear();
+                        app.history.push_back(Sample {
+                            at: 5.0,
+                            rx: 2_000.0,
+                            tx: 500.0,
+                        });
+                    }
+                    "stale" => {
+                        // Samples outside the window are skipped, not clamped.
+                        app.history.push_front(Sample {
+                            at: -500.0,
+                            rx: 9e9,
+                            tx: 9e9,
+                        });
+                        app.history.push_back(Sample {
+                            at: 1e9,
+                            rx: 1.0,
+                            tx: 1.0,
+                        });
+                    }
+                    "extremes" => {
+                        for (index, sample) in app.history.iter_mut().enumerate() {
+                            let high = index % 3 == 0;
+                            sample.rx = if high { 50e6 } else { 0.0 };
+                            sample.tx = if high { 0.0 } else { 50e6 };
+                        }
+                    }
+                    "long" => app.settings.history_seconds = 600,
+                    _ => {}
+                }
+                hash = draw_hash(hash, &mut app, width, height);
+            }
+        }
+    }
+    assert_eq!(hash, 8757548152055282732);
+}
+
+#[test]
+fn main_key_handling_keeps_the_recorded_state_trace() {
+    use crossterm::event::KeyModifiers;
+
+    let ctrl = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
+    let key = |code| KeyEvent::from(code);
+    let mut app = app();
+    app.visible_rows = 3;
+    app.snapshot.interfaces[0].state = "down".into();
+    let mut script = vec![
+        key(KeyCode::F(12)),
+        key(KeyCode::Down),
+        key(KeyCode::Char('j')),
+        key(KeyCode::PageDown),
+        key(KeyCode::PageDown),
+        key(KeyCode::Up),
+        key(KeyCode::Char('k')),
+        key(KeyCode::PageUp),
+        key(KeyCode::End),
+        key(KeyCode::Home),
+        key(KeyCode::Char('x')),
+        key(KeyCode::Char('s')),
+        key(KeyCode::Char('s')),
+        key(KeyCode::Char('c')),
+        key(KeyCode::F(4)),
+        key(KeyCode::Char('b')),
+        key(KeyCode::Char('b')),
+        key(KeyCode::Char(' ')),
+        key(KeyCode::F(9)),
+        key(KeyCode::F(1)),
+        key(KeyCode::Down),
+        key(KeyCode::Esc),
+        key(KeyCode::Char('?')),
+        ctrl('c'),
+        key(KeyCode::F(12)),
+        key(KeyCode::F(10)),
+        key(KeyCode::Char('q')),
+        key(KeyCode::F(5)),
+        key(KeyCode::Down),
+        key(KeyCode::Esc),
+        key(KeyCode::Char('i')),
+        key(KeyCode::Esc),
+        key(KeyCode::F(6)),
+        key(KeyCode::Down),
+        key(KeyCode::Enter),
+        key(KeyCode::F(2)),
+        key(KeyCode::F(10)),
+        key(KeyCode::Tab),
+        key(KeyCode::Tab),
+        key(KeyCode::BackTab),
+        key(KeyCode::BackTab),
+        key(KeyCode::F(5)),
+        key(KeyCode::Home),
+        key(KeyCode::Enter),
+        key(KeyCode::BackTab),
+        key(KeyCode::F(3)),
+        key(KeyCode::Char('q')),
+        key(KeyCode::Char('/')),
+        ctrl('x'),
+        key(KeyCode::F(12)),
+        key(KeyCode::Down),
+        key(KeyCode::Backspace),
+        key(KeyCode::Backspace),
+        key(KeyCode::Backspace),
+        key(KeyCode::Char('d')),
+        key(KeyCode::Enter),
+        key(KeyCode::Down),
+        key(KeyCode::Esc),
+        key(KeyCode::Char('/')),
+        key(KeyCode::Char('s')),
+        key(KeyCode::Esc),
+        key(KeyCode::Char('/')),
+        ctrl('c'),
+    ];
+    // The search filter is bounded even for pasted input.
+    script.extend(std::iter::repeat_n(key(KeyCode::Char('z')), 260));
+    script.extend([key(KeyCode::Enter), key(KeyCode::F(10))]);
+    let mut trace = String::new();
+    for (step, event) in script.into_iter().enumerate() {
+        if step % 7 == 0 {
+            app.notice = Some(format!("notice {step}"));
+        }
+        let action = app.handle_key(event);
+        trace.push_str(&format!(
+            "{step} {event:?} -> {action:?} {:?} picker={} scroll={} search={} {:?} paused={} \
+             selected={:?} iface={:?} notice={:?} history={} {:?} {:?}\n",
+            app.overlay,
+            app.picker,
+            app.help_scroll,
+            app.searching,
+            app.filter,
+            app.paused,
+            app.table.selected(),
+            app.interface,
+            app.notice,
+            app.history.len(),
+            app.settings,
+            app.touched,
+        ));
+    }
+    // Tab skips non-up interfaces; with none left it changes nothing.
+    for iface in &mut app.snapshot.interfaces {
+        iface.state = "down".into();
+        iface.name = format!("x{}", iface.name);
+    }
+    for event in [key(KeyCode::Tab), key(KeyCode::BackTab)] {
+        let action = app.handle_key(event);
+        trace.push_str(&format!("{action:?} {:?}\n", app.interface));
+    }
+    assert_eq!(fnv(FNV_OFFSET, &trace), 6960483453550570688);
+}
+
+#[test]
+fn setup_sort_row_steps_through_sorts_and_wraps_both_ways() {
+    let mut app = app();
+    assert_eq!(app.settings.sort, Sort::Traffic);
+    app.handle_key(KeyCode::F(2).into());
+    for _ in 0..3 {
+        app.handle_key(KeyCode::Down.into());
+    }
+    app.handle_key(KeyCode::Right.into());
+    app.handle_key(KeyCode::Down.into());
+    let mut sorts = Vec::new();
+    for code in ['+', '-', '-', '-', '=', '+'] {
+        assert_eq!(
+            app.handle_key(KeyCode::Char(code).into()),
+            Action::SettingsChanged
+        );
+        sorts.push(app.settings.sort);
+    }
+    assert_eq!(
+        sorts,
+        [
+            Sort::Receive,
+            Sort::Traffic,
+            Sort::Name,
+            Sort::Pid,
+            Sort::Name,
+            Sort::Traffic
+        ]
+    );
+}
+
+/// Distinct Setup values per profile so every label variant is rendered.
+fn setup_profile(app: &mut App, profile: usize, lang: Lang) {
+    use crate::config::PlotColor;
+
+    app.system_lang = lang;
+    let fixed = match lang {
+        Lang::En => Language::En,
+        Lang::De => Language::De,
+    };
+    match profile {
+        0 => app.settings.language = fixed,
+        1 => {
+            app.settings.language = fixed;
+            app.settings.color = false;
+            app.settings.bits = true;
+            app.settings.interval_ms = 100;
+            app.settings.show_graph = false;
+            app.settings.history_seconds = 600;
+            app.settings.graph_style = GraphStyle::Braille;
+            app.settings.rx_color = PlotColor::Red;
+            app.settings.tx_color = PlotColor::White;
+            app.settings.connections = true;
+            app.settings.sort = Sort::Name;
+            app.settings.show_idle = true;
+            app.settings.interface = Some("all".into());
+            app.auto_interface = None;
+            app.touched.insert(Field::Color);
+        }
+        2 => {
+            app.settings.language = Language::Auto;
+            app.settings.interval_ms = 60_000;
+            app.settings.rx_color = PlotColor::Blue;
+            app.settings.tx_color = PlotColor::Magenta;
+            app.settings.interface = Some("lo".into());
+            app.auto_interface = Some("enp112s0".into());
+            app.notice = Some("Could not save settings".into());
+            app.notice_error = true;
+        }
+        _ => {
+            app.settings.language = fixed;
+            app.settings.rx_color = PlotColor::Cyan;
+            app.settings.tx_color = PlotColor::Green;
+            app.settings.interface = None;
+            app.settings.sort = Sort::Pid;
+            app.notice = Some("Settings saved".into());
+            app.notice_error = false;
+        }
+    }
+}
+
+#[test]
+fn setup_renders_the_same_cells_for_every_row_value_and_size() {
+    // Recorded on the unmodified overlay renderer.
+    let mut hash = FNV_OFFSET;
+    for lang in [Lang::En, Lang::De] {
+        for (width, height) in [(36, 16), (40, 24), (60, 20), (120, 36)] {
+            for profile in 0..4 {
+                for category in 0..CATEGORY_COUNT {
+                    let mut app = app();
+                    setup_profile(&mut app, profile, lang);
+                    app.overlay = Overlay::Setup;
+                    app.setup_category = category;
+                    // Unfocused, the description still follows the option.
+                    for option in [0, 1] {
+                        app.setup_focus = false;
+                        app.setup_option = option;
+                        hash = draw_hash(hash, &mut app, width, height);
+                    }
+                    app.setup_focus = true;
+                    for option in 0..app.setup_len() {
+                        app.setup_option = option;
+                        hash = draw_hash(hash, &mut app, width, height);
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(hash, 2320896944122356148);
+}
+
+#[test]
+fn help_renders_the_same_cells_for_scroll_positions_and_capture_states() {
+    // Recorded on the unmodified overlay renderer.
+    let mut hash = FNV_OFFSET;
+    for lang in [Language::En, Language::De] {
+        for (width, height) in [(36, 16), (40, 24), (80, 24), (120, 36)] {
+            for captured in [true, false] {
+                for scroll in [0, 7, 60] {
+                    let mut app = app();
+                    app.settings.language = lang;
+                    app.overlay = Overlay::Help;
+                    app.help_scroll = scroll;
+                    if !captured {
+                        app.snapshot.capture.active = false;
+                        app.snapshot.capture.message = "capture unavailable".into();
+                    }
+                    hash = draw_hash(hash, &mut app, width, height);
+                }
+            }
+        }
+    }
+    assert_eq!(hash, 818637298919642789);
 }
