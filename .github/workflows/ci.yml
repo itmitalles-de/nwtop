@@ -91,7 +91,9 @@ jobs:
           --volume "$PWD:/work:ro" nwtop-test
           python3 tests/helper.py --isolated target/release/nwtop target/release/nwtop-collector
       - name: Check installer
-        run: shellcheck scripts/*.sh
+        run: shellcheck scripts/*.sh tests/*.sh
+      - name: Test release archive layout
+        run: bash tests/release_layout.sh target/release
   audit:
     runs-on: ubuntu-24.04
     timeout-minutes: 20

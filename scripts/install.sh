@@ -21,6 +21,11 @@ destination="$install_dir/nwtop"
 receipt="$install_dir/.nwtop-install.sha256"
 staged_binary=''
 staged_receipt=''
+# A release archive ships bin/nwtop instead of the source tree.
+prebuilt=0
+if [[ -f "$repo_dir/bin/nwtop" && ! -e "$repo_dir/Cargo.toml" ]]; then
+    prebuilt=1
+fi
 
 cleanup() {
     if [[ -n "$staged_binary" && ( -e "$staged_binary" || -L "$staged_binary" ) ]]; then
@@ -32,7 +37,9 @@ cleanup() {
 }
 trap cleanup EXIT
 
-for command in cargo install mktemp sha256sum; do
+required=(install mktemp sha256sum)
+if (( ! prebuilt )); then required+=(cargo); fi
+for command in "${required[@]}"; do
     if ! command -v "$command" >/dev/null 2>&1; then
         printf 'Required command not found: %s\n' "$command" >&2
         exit 1
@@ -62,6 +69,10 @@ check_destination() {
 }
 
 build_options=()
+if (( extended && prebuilt )); then
+    printf 'Release archives contain the standard build; build from source for extended attribution.\n' >&2
+    exit 1
+fi
 if (( extended )); then
     bpf_clang="${NWTOP_BPF_CLANG:-clang}"
     if ! command -v "$bpf_clang" >/dev/null 2>&1 ||
@@ -82,11 +93,16 @@ HEADERS
     build_options=(--features ebpf)
 fi
 check_destination
-cargo build --release --locked "${build_options[@]}" --manifest-path "$repo_dir/Cargo.toml" --target-dir "$repo_dir/target"
+if (( prebuilt )); then
+    source_binary="$repo_dir/bin/nwtop"
+else
+    cargo build --release --locked "${build_options[@]}" --manifest-path "$repo_dir/Cargo.toml" --target-dir "$repo_dir/target"
+    source_binary="$repo_dir/target/release/nwtop"
+fi
 mkdir -p -- "$install_dir"
 staged_binary="$(mktemp "$install_dir/.nwtop-binary.XXXXXX")"
 staged_receipt="$(mktemp "$install_dir/.nwtop-receipt.XXXXXX")"
-install -m 755 -- "$repo_dir/target/release/nwtop" "$staged_binary"
+install -m 755 -- "$source_binary" "$staged_binary"
 read -r installed_digest _ < <(sha256sum -- "$staged_binary")
 printf '%s\n' "$installed_digest" > "$staged_receipt"
 chmod 600 -- "$staged_receipt"

@@ -32,7 +32,7 @@ jobs:
       - name: Validate entrypoint and domain
         run: |
           test -s site/index.html
-          test "$(cat site/CNAME)" = "nettop.wutz.io"
+          test "$(cat site/CNAME)" = "nwtop.wutz.io"
       - name: Package static site
         uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
         with:
@@ -60,11 +60,11 @@ jobs:
           curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
             --retry 6 --retry-all-errors --retry-delay 10 --retry-max-time 180 \
             --connect-timeout 10 --max-time 25 \
-            https://nettop.wutz.io/ -o "$RUNNER_TEMP/nwtop-index.html"
+            https://nwtop.wutz.io/ -o "$RUNNER_TEMP/nwtop-index.html"
           python3 - <<'PY'
           import os
           from pathlib import Path
           html = (Path(os.environ["RUNNER_TEMP"]) / "nwtop-index.html").read_text()
           assert '<title>nwtop — your network, in view</title>' in html
-          assert 'assets/nettop-demo.mp4' in html
+          assert 'assets/nwtop-demo.mp4' in html
           PY

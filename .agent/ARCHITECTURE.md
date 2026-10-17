@@ -122,11 +122,18 @@ capture drops, interface rates and duplicate counting. UI and parser boundary
 behavior is also covered by Rust tests. Review evidence is local and excluded
 from the repository.
 
+Release archives are built by `.github/workflows/release.yml` from a `vX.Y.Z`
+tag: standard (non-eBPF) `nwtop` and `nwtop-collector` for x86_64/aarch64 on
+Ubuntu 22.04, plus both scripts. The scripts detect that layout (`bin/` present,
+no `Cargo.toml`) and install the shipped binaries instead of building; the
+helper's root phase and digest verification are identical in both layouts.
+
 The public project website is a dependency-free static site in `site/`, deployed
 by `.github/workflows/pages.yml` from `main`. Only `site/` is uploaded to Pages;
-the source repository is also public under GPL-3.0-or-later. `nettop.wutz.io` is a DNS-only Cloudflare
-CNAME to `itmitalles-de.github.io`, with HTTPS enforced by Pages. Deployment checks
-the public HTTPS endpoint. The site uses local fonts and explicit DEMO
+the source repository is also public under GPL-3.0-or-later. `nwtop.wutz.io` is a DNS-only Cloudflare
+CNAME to `itmitalles-software.github.io`, with HTTPS enforced by Pages; the former
+`nettop.wutz.io` is a proxied Cloudflare record whose page rule redirects (301) to
+it. Deployment checks the public HTTPS endpoint. The site uses local fonts and explicit DEMO
 captures as intentional public product assets; local QA evidence stays outside Git.
 
 ## Optional extended attribution

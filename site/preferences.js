@@ -4,8 +4,8 @@
   var theme = null;
   var lang = null;
   try {
-    theme = localStorage.getItem('nettop-theme');
-    lang = localStorage.getItem('nettop-lang');
+    theme = localStorage.getItem('nwtop-theme');
+    lang = localStorage.getItem('nwtop-lang');
   } catch (error) {
     // Storage can be unavailable (private mode, blocked site data); fall back to system preferences.
   }

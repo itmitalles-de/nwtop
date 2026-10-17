@@ -6,7 +6,8 @@ default-run = "nwtop"
 rust-version = "1.88"
 description = "An nvtop-inspired Linux network monitor with live graphs and per-process traffic"
 license = "GPL-3.0-or-later"
-repository = "https://github.com/itmitalles-de/nwtop"
+repository = "https://github.com/itmitalles-software/nwtop"
+homepage = "https://nwtop.wutz.io"
 
 [features]
 default = []
